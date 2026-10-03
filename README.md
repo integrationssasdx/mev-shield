@@ -9,7 +9,7 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 ## 状态
 
 已实现：JSON 批处理校验、夹子检测、reject / quarantine 策略、
-打包排序与回滚记录，以及区块期限保护。
+fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
 
 ## 区块期限
 
@@ -20,6 +20,26 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 - `deadline < block` 的交易过期：不参与夹子识别、`order` 与 `kept`，
   在非拒绝结果中按输入位置记一条 `DEADLINE_EXPIRED` 回滚并进入
   `dropped`；该原因优先于 `REVERT` 与 `DEPENDENT_NONCE`。
+
+## 打包模式
+
+- 批次可选 `packing`，只接受 `fee`（缺省）或 `nonce`；其他值返回
+  `error` / `BAD_PACKING`，退出码 2，各列表字段为空。JSON、schema、
+  重复 hash、重复 nonce、`side`、`sim`、`policy`、期限错误均优先于
+  `BAD_PACKING`。
+- `fee`（含缺省与显式指定）：沿用 fee 降序、hash 升序与既有
+  `DEPENDENT_NONCE` 规则，行为不变。
+- `nonce`：先排除过期交易；reject 命中夹子仍整批拒绝，quarantine
+  命中仍隔离攻击腿、保留 victim 及其余交易。对每个 `from` 的剩余
+  成功交易，`sim` 为 `revert` 的记 `REVERT` 并排除；以该道最大 nonce
+  为终点向下保留最长连续 nonce 后缀，后缀内保留，后缀外记
+  `DEPENDENT_NONCE`。
+- `nonce` 排序：发送者道内按 nonce 升序；发送者道之间按道内最高
+  fee 降序，最高 fee 相同按道内最小 hash 升序。
+- 回滚原因优先级：`SANDWICH_DETECTED`（仅 quarantine 攻击腿，
+  reject 不写 rollback）、`DEADLINE_EXPIRED`、`REVERT`、
+  `DEPENDENT_NONCE`；每笔交易只记一次。`rollback` / `dropped`
+  按输入位置排列，`order` 与 `kept` 同序。
 
 ## 约定
 

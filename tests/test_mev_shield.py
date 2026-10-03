@@ -627,6 +627,283 @@ class TestDeadline(unittest.TestCase):
         self.assertEqual(parsed["status"], "error")
 
 
+class TestPacking(unittest.TestCase):
+    def payload_packing(self, ident, txs, packing=...):
+        data = {"id": ident, "transactions": txs}
+        if packing is not ...:
+            data["packing"] = packing
+        return json.dumps(data)
+
+    def payload_full(self, ident, txs, packing, policy=None, block=None):
+        data = {"id": ident, "transactions": txs, "packing": packing}
+        if policy is not None:
+            data["policy"] = policy
+        if block is not None:
+            data["block"] = block
+        return json.dumps(data)
+
+    def with_deadline(self, t, deadline):
+        t = dict(t)
+        t["deadline"] = deadline
+        return t
+
+    def test_bad_packing_values(self):
+        for bad in ("NONCE", "Fee", "", "nonce ", 1, None, True, ["nonce"], {}):
+            with self.subTest(bad=bad):
+                res, err = core.process(
+                    self.payload_packing("z", [tx("h", "A", 0, 1)], bad))
+                self.assertEqual(err, "BAD_PACKING")
+                self.assertEqual(res["status"], "error")
+                self.assertEqual(res["code"], "BAD_PACKING")
+                self.assertEqual(res["id"], "z")
+                for k in ("order", "hits", "rollback", "kept", "dropped"):
+                    self.assertEqual(res[k], [])
+                self.assertEqual(list(res.keys()),
+                                 ["id", "status", "code", "order", "hits",
+                                  "rollback", "kept", "dropped"])
+
+    def test_bad_packing_existing_errors_take_priority(self):
+        # JSON / schema / 重复 hash / 重复 nonce / side / sim / policy /
+        # 期限错误均优先于 BAD_PACKING
+        cases = [
+            ("BAD_JSON", "{bad"),
+            ("BAD_SCHEMA", json.dumps({"id": 5, "transactions": [],
+                                       "packing": "wat"})),
+            ("DUP_HASH", self.payload_packing("z", [
+                tx("d", "A", 0, 1), tx("d", "B", 0, 1)], "wat")),
+            ("DUP_NONCE", self.payload_packing("z", [
+                tx("a", "A", 0, 1), tx("b", "A", 0, 1)], "wat")),
+            ("BAD_SIDE", self.payload_packing("z", [
+                tx("h", "A", 0, 1, side="x")], "wat")),
+            ("BAD_SIM", self.payload_packing("z", [
+                tx("h", "A", 0, 1, sim="nope")], "wat")),
+            ("BAD_POLICY", json.dumps(
+                {"id": "z", "transactions": [], "policy": "hold",
+                 "packing": "wat"})),
+            ("BAD_DEADLINE", json.dumps(
+                {"id": "z", "transactions": [], "block": "no",
+                 "packing": "wat"})),
+        ]
+        for code, raw in cases:
+            with self.subTest(code=code):
+                res, err = core.process(raw)
+                self.assertEqual(err, code)
+                self.assertEqual(res["code"], code)
+
+    def test_default_and_explicit_fee_identical(self):
+        txs = [
+            tx("a0", "A", 0, 10),
+            tx("a1", "A", 1, 99, side="sell", sim="revert"),
+            tx("a2", "A", 2, 5),
+            tx("b0", "B", 0, 100, side="sell"),
+        ]
+        out_default = core.serialize(core.process(self.payload_packing("j", txs))[0])
+        out_fee = core.serialize(
+            core.process(self.payload_packing("j", txs, "fee"))[0])
+        out_nonce = core.serialize(
+            core.process(self.payload_packing("j", txs, "nonce"))[0])
+        self.assertEqual(out_default, out_fee)
+        # fee 模式：fee 降序 b0(100), a2(5)；a1 revert，a0 依赖
+        parsed = json.loads(out_fee)
+        self.assertEqual(parsed["order"], ["b0", "a2"])
+
+    def test_nonce_longest_suffix(self):
+        # A: nonce 0,2,3 全成功 -> 以 3 为终点连续后缀 {2,3}，0 记 DEPENDENT_NONCE
+        txs = [tx("a0", "A", 0, 1), tx("a2", "A", 2, 9), tx("a3", "A", 3, 2)]
+        res, err = core.process(self.payload_packing("n", txs, "nonce"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["code"], "")
+        self.assertEqual(res["order"], ["a2", "a3"])
+        self.assertEqual(res["kept"], ["a2", "a3"])
+        self.assertEqual(res["dropped"], ["a0"])
+        self.assertEqual(res["rollback"],
+                         [{"hash": "a0", "at": 0, "reason": "DEPENDENT_NONCE"}])
+
+    def test_nonce_multi_gap(self):
+        # 成功 nonce {0,1,4,5,6} -> 保留 {4,5,6}，道内 nonce 升序
+        txs = [
+            tx("s0", "S", 0, 5), tx("s1", "S", 1, 5),
+            tx("s4", "S", 4, 5), tx("s5", "S", 5, 5), tx("s6", "S", 6, 5),
+        ]
+        res, _ = core.process(self.payload_packing("n", txs, "nonce"))
+        self.assertEqual(res["order"], ["s4", "s5", "s6"])
+        self.assertEqual(res["dropped"], ["s0", "s1"])
+        self.assertEqual(
+            [e["reason"] for e in res["rollback"]],
+            ["DEPENDENT_NONCE", "DEPENDENT_NONCE"])
+
+    def test_nonce_revert_excluded_before_suffix(self):
+        # {0 成功, 1 revert, 2 成功}：成功集合 {0,2}，2 向下断裂 -> 只留 2；
+        # 0 记 DEPENDENT_NONCE，1 记 REVERT，rollback 按输入位置
+        txs = [
+            tx("s0", "S", 0, 10),
+            tx("s1", "S", 1, 10, sim="revert"),
+            tx("s2", "S", 2, 10),
+        ]
+        res, _ = core.process(self.payload_packing("n", txs, "nonce"))
+        self.assertEqual(res["order"], ["s2"])
+        self.assertEqual(res["dropped"], ["s0", "s1"])
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "s0", "at": 0, "reason": "DEPENDENT_NONCE"},
+                {"hash": "s1", "at": 1, "reason": "REVERT"},
+            ],
+        )
+
+    def test_nonce_lane_order(self):
+        # A 道：n5(fee10) n4(fee100)，道内最高 fee 100、最小 hash a4
+        # C 道：n1(fee1)  n0(fee100)，道内最高 fee 100、最小 hash c0
+        # B 道：n0(fee50)
+        # 道间：A、C 最高 fee 同为 100，按最小 hash a4 < c0；其后 B
+        # 输入顺序故意打乱
+        txs = [
+            tx("a5", "A", 5, 10),
+            tx("b0", "B", 0, 50, side="sell"),
+            tx("c1", "C", 1, 1, side="sell"),
+            tx("a4", "A", 4, 100, side="sell"),
+            tx("c0", "C", 0, 100),
+        ]
+        res, _ = core.process(self.payload_packing("n", txs, "nonce"))
+        self.assertEqual(res["order"],
+                         ["a4", "a5", "c0", "c1", "b0"])
+        self.assertEqual(res["kept"], res["order"])
+        self.assertEqual(res["dropped"], [])
+
+    def test_nonce_lane_tie_uses_min_hash_of_lane(self):
+        # 两道最高 fee 同为 9：P 道含 hash 更小的 pa（虽其 fee 仅 1），
+        # 故 P 道排在 Q 道之前
+        txs = [
+            tx("pz", "P", 1, 9),
+            tx("pa", "P", 0, 1),
+            tx("q0", "Q", 0, 9),
+        ]
+        res, _ = core.process(self.payload_packing("n", txs, "nonce"))
+        self.assertEqual(res["order"], ["pa", "pz", "q0"])
+
+    def test_nonce_empty_batch(self):
+        res, err = core.process(self.payload_packing("e", [], "nonce"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["order"], [])
+
+    def test_nonce_expired_excluded_first(self):
+        # block=5：n1 过期。剩余成功 {0,2}，后缀只含 2；
+        # n0 记 DEPENDENT_NONCE，n1 记 DEADLINE_EXPIRED，按输入位置
+        txs = [
+            tx("a0", "A", 0, 10),
+            self.with_deadline(tx("a1", "A", 1, 10), 4),
+            tx("a2", "A", 2, 10),
+        ]
+        res, _ = core.process(self.payload_full("n", txs, "nonce", block=5))
+        self.assertEqual(res["order"], ["a2"])
+        self.assertEqual(res["dropped"], ["a0", "a1"])
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "a0", "at": 0, "reason": "DEPENDENT_NONCE"},
+                {"hash": "a1", "at": 1, "reason": "DEADLINE_EXPIRED"},
+            ],
+        )
+
+        # n0 过期、n1/n2 成功 -> {1,2} 连续，全部保留
+        txs2 = [
+            self.with_deadline(tx("b0", "B", 0, 10), 0),
+            tx("b1", "B", 1, 10),
+            tx("b2", "B", 2, 10),
+        ]
+        res2, _ = core.process(self.payload_full("n", txs2, "nonce", block=5))
+        self.assertEqual(res2["order"], ["b1", "b2"])
+        self.assertEqual(res2["dropped"], ["b0"])
+        self.assertEqual(res2["rollback"],
+                         [{"hash": "b0", "at": 0, "reason": "DEADLINE_EXPIRED"}])
+
+    def test_nonce_reject_still_whole_batch(self):
+        txs = [
+            tx("f", "MEV", 0, 10, side="buy"),
+            tx("v", "USER", 0, 5, side="buy"),
+            tx("b", "MEV", 1, 10, side="sell"),
+        ]
+        res, err = core.process(self.payload_packing("s", txs, "nonce"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(res["code"], "SANDWICH_DETECTED")
+        self.assertEqual(len(res["hits"]), 1)
+        self.assertEqual(res["order"], [])
+        self.assertEqual(res["kept"], [])
+        self.assertEqual(res["dropped"], [])
+        self.assertEqual(res["rollback"], [])
+
+    def test_nonce_quarantine_mitigated(self):
+        txs = [
+            tx("f", "MEV", 0, 10, side="buy"),    # 0 攻击腿
+            tx("v", "USER", 0, 5, side="buy"),    # 1 victim 保留
+            tx("b", "MEV", 1, 10, side="sell"),   # 2 攻击腿
+            tx("r", "OTHER", 0, 7, sim="revert"),  # 3 REVERT
+            tx("d0", "DEP", 0, 3),                # 4 连续后缀
+            tx("d1", "DEP", 1, 4),                # 5
+            tx("x0", "X", 0, 2),                  # 6 后缀外
+            tx("x2", "X", 2, 6),                  # 7 保留，且使 X 道最高 fee
+        ]
+        res, err = core.process(
+            self.payload_full("q", txs, "nonce", policy="quarantine"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual(res["code"], "SANDWICH_MITIGATED")
+        self.assertEqual([h["at"] for h in res["hits"]], [[0, 1, 2]])
+        # 道：X 最高 fee 6 -> v(5) -> D(4)；D 道 nonce 升序
+        self.assertEqual(res["order"], ["x2", "v", "d0", "d1"])
+        self.assertEqual(res["kept"], res["order"])
+        self.assertEqual(res["dropped"], ["f", "b", "r", "x0"])
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "f", "at": 0, "reason": "SANDWICH_DETECTED"},
+                {"hash": "b", "at": 2, "reason": "SANDWICH_DETECTED"},
+                {"hash": "r", "at": 3, "reason": "REVERT"},
+                {"hash": "x0", "at": 6, "reason": "DEPENDENT_NONCE"},
+            ],
+        )
+
+    def test_nonce_deterministic_bytes(self):
+        txs = [
+            tx("a5", "A", 5, 10),
+            tx("a4", "A", 4, 100),
+            tx("c1", "C", 1, 1, sim="revert"),
+            tx("b0", "B", 0, 50),
+        ]
+        raw = self.payload_packing("x", txs, "nonce")
+        out1 = core.serialize(core.process(raw)[0])
+        out2 = core.serialize(core.process(raw)[0])
+        self.assertEqual(out1, out2)
+        self.assertTrue(out1.endswith("\n"))
+        self.assertNotIn(" ", out1.rstrip("\n"))
+
+    def test_cli_bad_packing_exit_two(self):
+        sin = io.BytesIO(json.dumps(
+            {"id": "z", "transactions": [], "packing": "nonce!"}).encode())
+        sout, serr = io.BytesIO(), io.StringIO()
+        code = run([], stdin_buffer=sin, stdout_buffer=sout, stderr=serr)
+        self.assertEqual(code, 2)
+        self.assertEqual(serr.getvalue(), "BAD_PACKING\n")
+        parsed = json.loads(sout.getvalue())
+        self.assertEqual(parsed["status"], "error")
+        self.assertEqual(parsed["code"], "BAD_PACKING")
+        for k in ("order", "hits", "rollback", "kept", "dropped"):
+            self.assertEqual(parsed[k], [])
+
+    def test_cli_nonce_ok_exit_zero(self):
+        raw = self.payload_packing(
+            "c", [tx("s0", "S", 0, 1), tx("s1", "S", 1, 9)], "nonce").encode()
+        sin = io.BytesIO(raw)
+        sout, serr = io.BytesIO(), io.StringIO()
+        code = run([], stdin_buffer=sin, stdout_buffer=sout, stderr=serr)
+        self.assertEqual(code, 0)
+        self.assertEqual(serr.getvalue(), "")
+        self.assertEqual(json.loads(sout.getvalue())["order"], ["s0", "s1"])
+
+
 class TestCli(unittest.TestCase):
     def invoke(self, argv, in_bytes=None):
         sin = io.BytesIO(in_bytes or b"")
