@@ -14,6 +14,7 @@ BAD_SIDE = "BAD_SIDE"
 BAD_SIM = "BAD_SIM"
 BAD_POLICY = "BAD_POLICY"
 BAD_DEADLINE = "BAD_DEADLINE"
+BAD_PACKING = "BAD_PACKING"
 BAD_ARGS = "BAD_ARGS"
 INPUT_IO = "INPUT_IO"
 OUTPUT_IO = "OUTPUT_IO"
@@ -28,6 +29,10 @@ DEADLINE_EXPIRED = "DEADLINE_EXPIRED"
 # 可选保护策略；缺省等价于 reject
 POLICY_REJECT = "reject"
 POLICY_QUARANTINE = "quarantine"
+
+# 可选打包模式；缺省等价于 fee（fee 降序、hash 升序）
+PACKING_FEE = "fee"
+PACKING_NONCE = "nonce"
 
 # 固定输出键顺序
 RESULT_KEYS = ("id", "status", "code", "order", "hits", "rollback", "kept", "dropped")
@@ -49,11 +54,15 @@ def _is_nonneg_int(value):
 
 
 def parse_input(raw):
-    """解析并校验输入，返回 (id, transactions, policy, block)；失败抛 ShieldError。
+    """解析并校验输入，返回 (id, transactions, policy, block, packing)；失败抛 ShieldError。
 
     可选区块期限字段：批次级 block（当前区块高度）与交易级 deadline
     （最后可执行区块），均须为非负整数（排除布尔值）。原输入全部有效后
     才校验这两个字段；类型错误或有 deadline 无 block 时抛 BAD_DEADLINE。
+
+    可选批次字段 packing 只接受 fee / nonce（缺省 fee）；它最后校验，
+    任何 JSON、schema、重复 hash/nonce、side、sim、policy、期限错误都优先
+    于 BAD_PACKING。
     """
     try:
         data = json.loads(raw)
@@ -143,7 +152,12 @@ def parse_input(raw):
             raise ShieldError(BAD_DEADLINE)
         parsed[at]["deadline"] = raw_deadlines[at]
 
-    return data["id"], parsed, policy, block
+    # packing 最后校验：原有全部错误（含 policy 与期限）均优先于 BAD_PACKING
+    packing = data.get("packing", PACKING_FEE)
+    if packing not in (PACKING_FEE, PACKING_NONCE):
+        raise ShieldError(BAD_PACKING)
+
+    return data["id"], parsed, policy, block, packing
 
 
 def peek_id(raw):
@@ -190,21 +204,78 @@ def detect_sandwiches(txs):
     return hits
 
 
-def build_no_sandwich(txs, expired=()):
-    """无夹子时：排除过期、revert 与同 from 中 nonce 更大的交易，其余排序打包。
+def _nonce_suffix_keep(txs, excluded):
+    """在未排除（excluded 为输入位置集合）的成功交易上，按 from 计算以
+    最大 nonce 为终点的最长连续 nonce 后缀，返回保留位置集合。
+
+    每个 from 的 nonce 已由输入校验保证唯一；被排除位置（过期或隔离的
+    攻击腿）与 revert 交易均不参与后缀，也不影响连续性。
+    """
+    by_sender = {}
+    for at, tx in enumerate(txs):
+        if at in excluded or tx["sim"] != "success":
+            continue
+        by_sender.setdefault(tx["from"], []).append((tx["nonce"], at))
+    keep = set()
+    for entries in by_sender.values():
+        entries.sort()
+        chain = [entries[-1]]
+        for nonce, at in reversed(entries[:-1]):
+            if nonce == chain[0][0] - 1:
+                chain.insert(0, (nonce, at))
+            else:
+                break
+        keep.update(at for _nonce, at in chain)
+    return keep
+
+
+def _sort_survivors(txs, packing):
+    """fee 模式：fee 降序、hash 升序。
+
+    nonce 模式：按 from 分道，道内 nonce 升序；道间按道内最高 fee 降序，
+    最高 fee 相同则按道内最小 hash 升序。
+    """
+    if packing == PACKING_FEE:
+        return sorted(txs, key=lambda tx: (-tx["fee"], tx["hash"]))
+    lanes = {}
+    for tx in txs:
+        lanes.setdefault(tx["from"], []).append(tx)
+    ordered_senders = sorted(
+        lanes,
+        key=lambda sender: (
+            -max(tx["fee"] for tx in lanes[sender]),
+            min(tx["hash"] for tx in lanes[sender]),
+        ),
+    )
+    ordered = []
+    for sender in ordered_senders:
+        ordered.extend(sorted(lanes[sender], key=lambda tx: tx["nonce"]))
+    return ordered
+
+
+def build_no_sandwich(txs, expired=(), packing=PACKING_FEE):
+    """无夹子时：排除过期、revert 与不连续 nonce，其余排序打包。
 
     expired 为过期交易的输入位置集合。返回 (order, rollback, kept, dropped)：
-    rollback 按原位置记录；order/kept 按 fee 降序、hash 升序；
-    dropped 按原位置保存被排除的 hash。
-    原因优先级：DEADLINE_EXPIRED -> REVERT -> DEPENDENT_NONCE。
+    rollback 按原位置记录；dropped 按原位置保存被排除的 hash。
+
+    fee 模式（缺省）：同 from 中 nonce 小于该 from 最大 nonce 的交易记
+    DEPENDENT_NONCE，存活者按 fee 降序、hash 升序。原因优先级：
+    DEADLINE_EXPIRED -> REVERT -> DEPENDENT_NONCE。
+    nonce 模式：对每个 from 未过期的成功交易，以最大 nonce 为终点向下
+    保留最长连续 nonce 后缀，后缀外的成功交易记 DEPENDENT_NONCE；存活者
+    按发送者道排列（见 _sort_survivors）。
     """
     expired = set(expired)
-    # 每个 from 的最大 nonce
-    max_nonce = {}
-    for tx in txs:
-        sender = tx["from"]
-        if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
-            max_nonce[sender] = tx["nonce"]
+    if packing == PACKING_NONCE:
+        keep_idx = _nonce_suffix_keep(txs, expired)
+    else:
+        # 每个 from 的最大 nonce
+        max_nonce = {}
+        for tx in txs:
+            sender = tx["from"]
+            if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
+                max_nonce[sender] = tx["nonce"]
 
     rollback = []
     survivors = []
@@ -213,25 +284,31 @@ def build_no_sandwich(txs, expired=()):
             rollback.append({"hash": tx["hash"], "at": at, "reason": DEADLINE_EXPIRED})
         elif tx["sim"] == "revert":
             rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
+        elif packing == PACKING_NONCE:
+            if at in keep_idx:
+                survivors.append(tx)
+            else:
+                rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
         elif tx["nonce"] < max_nonce[tx["from"]]:
             rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
         else:
             survivors.append(tx)
 
-    survivors.sort(key=lambda tx: (-tx["fee"], tx["hash"]))
+    survivors = _sort_survivors(survivors, packing)
     order = [tx["hash"] for tx in survivors]
     dropped = [entry["hash"] for entry in rollback]
     return order, rollback, order[:], dropped
 
 
-def build_quarantine(txs, hits_idx, expired=()):
+def build_quarantine(txs, hits_idx, expired=(), packing=PACKING_FEE):
     """quarantine 策略：隔离全部命中的 buy/sell 攻击腿，保留 victim 及其余交易。
 
     expired 为过期交易的输入位置集合。返回 (order, rollback, kept, dropped)，
     约定同 build_no_sandwich。未进 order 的交易只记一次 rollback，原因优先级：
     SANDWICH_DETECTED（攻击腿） -> DEADLINE_EXPIRED -> REVERT -> DEPENDENT_NONCE
     （后两者在隔离后的剩余交易集合上判定；攻击腿由未过期命中构成，
-    与过期集合互不相交）。
+    与过期集合互不相交）。packing 选择 fee / nonce 两种判定与排序规则，
+    见 build_no_sandwich 与 _sort_survivors。
     攻击腿全部移除后，剩余交易按输入相对顺序不再含可识别夹子。
     """
     expired = set(expired)
@@ -240,14 +317,17 @@ def build_quarantine(txs, hits_idx, expired=()):
         attack.add(i)
         attack.add(k)
 
-    # 剩余交易每个 from 的最大 nonce
-    max_nonce = {}
-    for at, tx in enumerate(txs):
-        if at in attack:
-            continue
-        sender = tx["from"]
-        if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
-            max_nonce[sender] = tx["nonce"]
+    if packing == PACKING_NONCE:
+        keep_idx = _nonce_suffix_keep(txs, expired | attack)
+    else:
+        # 剩余交易每个 from 的最大 nonce
+        max_nonce = {}
+        for at, tx in enumerate(txs):
+            if at in attack:
+                continue
+            sender = tx["from"]
+            if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
+                max_nonce[sender] = tx["nonce"]
 
     rollback = []
     survivors = []
@@ -258,12 +338,17 @@ def build_quarantine(txs, hits_idx, expired=()):
             rollback.append({"hash": tx["hash"], "at": at, "reason": DEADLINE_EXPIRED})
         elif tx["sim"] == "revert":
             rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
+        elif packing == PACKING_NONCE:
+            if at in keep_idx:
+                survivors.append(tx)
+            else:
+                rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
         elif tx["nonce"] < max_nonce[tx["from"]]:
             rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
         else:
             survivors.append(tx)
 
-    survivors.sort(key=lambda tx: (-tx["fee"], tx["hash"]))
+    survivors = _sort_survivors(survivors, packing)
     order = [tx["hash"] for tx in survivors]
     dropped = [entry["hash"] for entry in rollback]
     return order, rollback, order[:], dropped
@@ -285,7 +370,7 @@ def error_result(ident, code):
 def process(raw):
     """处理输入文本，返回 (result_dict, error_code_or_None)。"""
     try:
-        ident, txs, policy, block = parse_input(raw)
+        ident, txs, policy, block, packing = parse_input(raw)
     except ShieldError as exc:
         return error_result(peek_id(raw), exc.code), exc.code
 
@@ -317,7 +402,8 @@ def process(raw):
 
     if policy == POLICY_QUARANTINE:
         if hits_idx:
-            order, rollback, kept, dropped = build_quarantine(txs, hits_idx, expired)
+            order, rollback, kept, dropped = build_quarantine(
+                txs, hits_idx, expired, packing)
             result = {
                 "id": ident,
                 "status": "mitigated",
@@ -343,7 +429,7 @@ def process(raw):
         }
         return result, None
 
-    order, rollback, kept, dropped = build_no_sandwich(txs, expired)
+    order, rollback, kept, dropped = build_no_sandwich(txs, expired, packing)
     result = {
         "id": ident,
         "status": "ok",
