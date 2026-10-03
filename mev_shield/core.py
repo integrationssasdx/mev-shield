@@ -12,14 +12,19 @@ DUP_HASH = "DUP_HASH"
 DUP_NONCE = "DUP_NONCE"
 BAD_SIDE = "BAD_SIDE"
 BAD_SIM = "BAD_SIM"
+BAD_POLICY = "BAD_POLICY"
 BAD_ARGS = "BAD_ARGS"
 INPUT_IO = "INPUT_IO"
 OUTPUT_IO = "OUTPUT_IO"
 
 # 业务状态码 / 回滚原因
 SANDWICH_DETECTED = "SANDWICH_DETECTED"
+SANDWICH_MITIGATED = "SANDWICH_MITIGATED"
 REVERT = "REVERT"
 DEPENDENT_NONCE = "DEPENDENT_NONCE"
+
+# 可选保护策略；缺省等价于 reject
+POLICIES = ("reject", "quarantine")
 
 # 固定输出键顺序
 RESULT_KEYS = ("id", "status", "code", "order", "hits", "rollback", "kept", "dropped")
@@ -41,7 +46,7 @@ def _is_nonneg_int(value):
 
 
 def parse_input(raw):
-    """解析并校验输入，返回 (id, transactions)；失败抛 ShieldError。"""
+    """解析并校验输入，返回 (id, transactions, policy)；失败抛 ShieldError。"""
     try:
         data = json.loads(raw)
     except ValueError:
@@ -51,6 +56,12 @@ def parse_input(raw):
         raise ShieldError(BAD_SCHEMA)
     if "id" not in data or not isinstance(data["id"], str):
         raise ShieldError(BAD_SCHEMA)
+
+    # 可选策略：缺省为 reject；只接受 POLICIES 中的字符串，否则 BAD_POLICY
+    policy = data.get("policy", "reject")
+    if policy not in POLICIES:
+        raise ShieldError(BAD_POLICY)
+
     txs = data.get("transactions")
     if not isinstance(txs, list):
         raise ShieldError(BAD_SCHEMA)
@@ -107,7 +118,7 @@ def parse_input(raw):
             }
         )
 
-    return data["id"], parsed
+    return data["id"], parsed, policy
 
 
 def peek_id(raw):
@@ -184,6 +195,46 @@ def build_no_sandwich(txs):
     return order, rollback, order[:], dropped
 
 
+def build_quarantine(txs, hits_idx):
+    """quarantine 策略：隔离全部命中三元组的 buy/sell 腿，其余交易照常打包。
+
+    victim 不删除。被隔离的攻击腿记 SANDWICH_DETECTED；其余未进 order 的
+    交易按 REVERT -> DEPENDENT_NONCE 顺序取原因（更大 nonce 在隔离后的
+    剩余交易内判定）。返回 (order, rollback, kept, dropped)，排序约定与
+    build_no_sandwich 相同。
+    """
+    legs = set()
+    for (i, _j, k) in hits_idx:
+        legs.add(i)
+        legs.add(k)
+
+    # 每个 from 在剩余交易中的最大 nonce
+    max_nonce = {}
+    for at, tx in enumerate(txs):
+        if at in legs:
+            continue
+        sender = tx["from"]
+        if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
+            max_nonce[sender] = tx["nonce"]
+
+    rollback = []
+    survivors = []
+    for at, tx in enumerate(txs):
+        if at in legs:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": SANDWICH_DETECTED})
+        elif tx["sim"] == "revert":
+            rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
+        elif tx["nonce"] < max_nonce[tx["from"]]:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
+        else:
+            survivors.append(tx)
+
+    survivors.sort(key=lambda tx: (-tx["fee"], tx["hash"]))
+    order = [tx["hash"] for tx in survivors]
+    dropped = [entry["hash"] for entry in rollback]
+    return order, rollback, order[:], dropped
+
+
 def error_result(ident, code):
     return {
         "id": ident,
@@ -200,7 +251,7 @@ def error_result(ident, code):
 def process(raw):
     """处理输入文本，返回 (result_dict, error_code_or_None)。"""
     try:
-        ident, txs = parse_input(raw)
+        ident, txs, policy = parse_input(raw)
     except ShieldError as exc:
         return error_result(peek_id(raw), exc.code), exc.code
 
@@ -216,16 +267,29 @@ def process(raw):
             }
             for (i, j, k) in hits_idx
         ]
-        result = {
-            "id": ident,
-            "status": "rejected",
-            "code": SANDWICH_DETECTED,
-            "order": [],
-            "hits": hits,
-            "rollback": [],
-            "kept": [],
-            "dropped": [],
-        }
+        if policy == "quarantine":
+            order, rollback, kept, dropped = build_quarantine(txs, hits_idx)
+            result = {
+                "id": ident,
+                "status": "mitigated",
+                "code": SANDWICH_MITIGATED,
+                "order": order,
+                "hits": hits,
+                "rollback": rollback,
+                "kept": kept,
+                "dropped": dropped,
+            }
+        else:
+            result = {
+                "id": ident,
+                "status": "rejected",
+                "code": SANDWICH_DETECTED,
+                "order": [],
+                "hits": hits,
+                "rollback": [],
+                "kept": [],
+                "dropped": [],
+            }
         return result, None
 
     order, rollback, kept, dropped = build_no_sandwich(txs)

@@ -21,8 +21,11 @@ def tx(h, frm, nonce, fee, token="TKN", side="buy", sim="success"):
     }
 
 
-def payload(ident, txs):
-    return json.dumps({"id": ident, "transactions": txs})
+def payload(ident, txs, policy=None):
+    data = {"id": ident, "transactions": txs}
+    if policy is not None:
+        data["policy"] = policy
+    return json.dumps(data)
 
 
 class TestCore(unittest.TestCase):
@@ -287,6 +290,162 @@ class TestCore(unittest.TestCase):
         self.assertEqual(res["order"], ["h"])
 
 
+class TestPolicy(unittest.TestCase):
+    def sandwich_txs(self):
+        return [
+            tx("front", "MEV", 0, 10, side="buy"),
+            tx("vic", "USER", 0, 5, side="buy"),
+            tx("back", "MEV", 1, 10, side="sell"),
+        ]
+
+    def test_default_policy_is_reject(self):
+        res, err = core.process(payload("d", self.sandwich_txs()))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(res["code"], "SANDWICH_DETECTED")
+
+    def test_explicit_reject(self):
+        res, err = core.process(payload("r", self.sandwich_txs(), "reject"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(res["code"], "SANDWICH_DETECTED")
+        self.assertEqual(len(res["hits"]), 1)
+        self.assertEqual(res["order"], [])
+        self.assertEqual(res["rollback"], [])
+
+    def test_bad_policy_values(self):
+        for bad in ("hold", "Reject", "", 0, 1, True, None, ["reject"], {"p": 1}):
+            raw = json.dumps({"id": "bp", "transactions": [], "policy": bad})
+            with self.subTest(policy=bad):
+                res, err = core.process(raw)
+                self.assertEqual(err, "BAD_POLICY")
+                self.assertEqual(res["id"], "bp")
+                self.assertEqual(res["status"], "error")
+                self.assertEqual(res["code"], "BAD_POLICY")
+                for k in ("order", "hits", "rollback", "kept", "dropped"):
+                    self.assertEqual(res[k], [])
+
+    def test_bad_policy_id_fallback(self):
+        res, err = core.process('{"id": 7, "transactions": [], "policy": "x"}')
+        self.assertEqual(err, "BAD_SCHEMA")  # id 校验在先
+        res2, err2 = core.process('{"transactions": [], "policy": "x"}')
+        self.assertEqual(err2, "BAD_SCHEMA")
+
+    def test_quarantine_mitigated(self):
+        res, err = core.process(payload("q", self.sandwich_txs(), "quarantine"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual(res["code"], "SANDWICH_MITIGATED")
+        # victim 保留，攻击腿隔离
+        self.assertEqual(res["order"], ["vic"])
+        self.assertEqual(res["kept"], ["vic"])
+        self.assertEqual(res["dropped"], ["front", "back"])
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "front", "at": 0, "reason": "SANDWICH_DETECTED"},
+                {"hash": "back", "at": 2, "reason": "SANDWICH_DETECTED"},
+            ],
+        )
+        hit = res["hits"][0]
+        self.assertEqual(list(hit.keys()), ["buy", "victim", "sell", "token", "at"])
+        self.assertEqual(hit["at"], [0, 1, 2])
+
+    def test_quarantine_no_hits_ok(self):
+        txs = [tx("a", "A", 0, 5), tx("b", "B", 0, 9, sim="revert")]
+        res, err = core.process(payload("q", txs, "quarantine"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["code"], "")
+        self.assertEqual(res["order"], ["a"])
+        self.assertEqual(res["hits"], [])
+        self.assertEqual(res["rollback"],
+                         [{"hash": "b", "at": 1, "reason": "REVERT"}])
+
+    def test_quarantine_reason_priority_and_sorting(self):
+        # 攻击腿同时 revert -> 仍记 SANDWICH_DETECTED（但 revert 腿不构成命中，
+        # 这里构造：命中腿 + 其余 revert / DEPENDENT_NONCE 混合）
+        txs = [
+            tx("f", "M", 0, 10, side="buy"),               # 0 攻击腿
+            tx("v", "U", 0, 5, side="buy"),                # 1 victim，fee 5
+            tx("s", "M", 1, 10, side="sell"),              # 2 攻击腿
+            tx("r", "R", 0, 7, sim="revert"),              # 3 REVERT
+            tx("n0", "N", 0, 6),                           # 4 DEPENDENT_NONCE
+            tx("n1", "N", 1, 6),                           # 5 保留，fee 6
+            tx("z", "Z", 0, 6),                            # 6 保留，fee 6
+        ]
+        res, err = core.process(payload("q", txs, "quarantine"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "f", "at": 0, "reason": "SANDWICH_DETECTED"},
+                {"hash": "s", "at": 2, "reason": "SANDWICH_DETECTED"},
+                {"hash": "r", "at": 3, "reason": "REVERT"},
+                {"hash": "n0", "at": 4, "reason": "DEPENDENT_NONCE"},
+            ],
+        )
+        self.assertEqual(res["dropped"], ["f", "s", "r", "n0"])
+        # fee 降序、hash 升序：n1(6) 与 z(6) 同 fee -> n1 先；v(5) 最后
+        self.assertEqual(res["order"], ["n1", "z", "v"])
+        self.assertEqual(res["kept"], res["order"])
+
+    def test_quarantine_leg_also_revert_still_sandwich_reason(self):
+        # 同一交易既是命中攻击腿又有其他问题 -> SANDWICH_DETECTED 优先；
+        # 用重叠命中验证：k 腿同时是另一组命中的 i 腿，只记一次
+        txs = [
+            tx("f1", "M", 0, 1, side="buy"),   # 0 hit(0,2,3) 的 buy
+            tx("f2", "M", 1, 1, side="buy"),   # 1 hit(1,2,3) 的 buy
+            tx("v", "U", 0, 1, side="buy"),    # 2 victim
+            tx("s", "M", 2, 1, side="sell"),   # 3 两组命中的 sell
+        ]
+        res, _ = core.process(payload("q", txs, "quarantine"))
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual([h["at"] for h in res["hits"]], [[0, 2, 3], [1, 2, 3]])
+        self.assertEqual(res["order"], ["v"])
+        self.assertEqual(
+            [e["reason"] for e in res["rollback"]],
+            ["SANDWICH_DETECTED"] * 3,
+        )
+        self.assertEqual(res["dropped"], ["f1", "f2", "s"])
+
+    def test_quarantine_result_has_no_sandwich(self):
+        # 剩余交易按同一检测定义不再存在夹子
+        txs = [
+            tx("a0", "M", 0, 1, token="A", side="buy"),
+            tx("b0", "M", 1, 1, token="B", side="buy"),
+            tx("av", "U", 0, 1, token="A", side="buy"),
+            tx("bv", "V", 0, 1, token="B", side="buy"),
+            tx("a1", "M", 2, 1, token="A", side="sell"),
+            tx("b1", "M", 3, 1, token="B", side="sell"),
+        ]
+        res, _ = core.process(payload("q", txs, "quarantine"))
+        self.assertEqual(res["status"], "mitigated")
+        remaining = [t for t in txs if t["hash"] in res["order"]]
+        self.assertEqual(core.detect_sandwiches(remaining), [])
+
+    def test_quarantine_dependent_nonce_ignores_quarantined_legs(self):
+        # 攻击腿的更大 nonce 不影响剩余交易的 DEPENDENT_NONCE 判定：
+        # 攻击者 M 的 nonce1(sell 腿)被隔离后，M 的 nonce0 buy 若也是腿则隔离；
+        # 这里验证 victim 侧：U 的 nonce0 是 victim，U 无其他交易 -> 保留
+        res, _ = core.process(payload("q", self.sandwich_txs(), "quarantine"))
+        self.assertEqual(res["order"], ["vic"])
+
+    def test_extra_keys_ignored_with_policy(self):
+        raw = json.dumps({
+            "id": "x", "policy": "quarantine", "extra": 1,
+            "transactions": [
+                {"hash": "h", "from": "A", "nonce": 0, "fee": 1,
+                 "token": "t", "side": "buy", "sim": "success", "memo": 9},
+            ],
+        })
+        res, err = core.process(raw)
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["order"], ["h"])
+
+
 class TestCli(unittest.TestCase):
     def invoke(self, argv, in_bytes=None):
         sin = io.BytesIO(in_bytes or b"")
@@ -319,6 +478,30 @@ class TestCli(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out)["code"], "BAD_JSON")
         self.assertEqual(err.strip(), "BAD_JSON")
+
+    def test_bad_policy_exit_two(self):
+        data = payload("p", [], "hold").encode()
+        code, out, err = self.invoke([], data)
+        self.assertEqual(code, 2)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["status"], "error")
+        self.assertEqual(parsed["code"], "BAD_POLICY")
+        self.assertEqual(parsed["id"], "p")
+        self.assertEqual(err.strip(), "BAD_POLICY")
+
+    def test_quarantine_exit_zero(self):
+        data = payload("q", [
+            tx("f", "M", 0, 1, side="buy"),
+            tx("v", "U", 0, 1, side="buy"),
+            tx("b", "M", 1, 1, side="sell"),
+        ], "quarantine").encode()
+        code, out, err = self.invoke([], data)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        parsed = json.loads(out)
+        self.assertEqual(parsed["status"], "mitigated")
+        self.assertEqual(parsed["code"], "SANDWICH_MITIGATED")
+        self.assertEqual(parsed["order"], ["v"])
 
     def test_bad_args(self):
         for argv in (["--nope"], ["--input"], ["pos"], ["--input=a", "--input=b"],
