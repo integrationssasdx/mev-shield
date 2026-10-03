@@ -14,17 +14,25 @@ from mev_shield import core
 from mev_shield.cli import run
 
 
-def tx(h, frm, nonce, fee, token="TKN", side="buy", sim="success"):
-    return {
+def tx(h, frm, nonce, fee, token="TKN", side="buy", sim="success", deadline=None):
+    d = {
         "hash": h, "from": frm, "nonce": nonce, "fee": fee,
         "token": token, "side": side, "sim": sim,
     }
+    if deadline is not None:
+        d["deadline"] = deadline
+    return d
 
 
-def payload(ident, txs, policy=None):
+_NO_BLOCK = object()
+
+
+def payload(ident, txs, policy=None, block=_NO_BLOCK):
     data = {"id": ident, "transactions": txs}
     if policy is not None:
         data["policy"] = policy
+    if block is not _NO_BLOCK:
+        data["block"] = block
     return json.dumps(data)
 
 
@@ -288,6 +296,240 @@ class TestCore(unittest.TestCase):
         res, err = core.process(raw)
         self.assertIsNone(err)
         self.assertEqual(res["order"], ["h"])
+
+
+class TestDeadline(unittest.TestCase):
+    def sandwich(self, deadlines=(None, None, None), **kw):
+        legs = [
+            tx("f", "MEV", 0, 10, side="buy", deadline=deadlines[0]),
+            tx("v", "USER", 0, 5, side="buy", deadline=deadlines[1]),
+            tx("b", "MEV", 1, 10, side="sell", deadline=deadlines[2]),
+        ]
+        return payload("s", legs, **kw)
+
+    def test_block_only_and_empty_are_ok(self):
+        for raw in (payload("e", [], block=0), payload("e2", []),
+                    payload("e3", [tx("h", "A", 0, 3)], block=7)):
+            res, err = core.process(raw)
+            self.assertIsNone(err)
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["code"], "")
+            self.assertEqual(res["hits"], [])
+
+    def test_expiry_boundary(self):
+        # deadline == block 可执行；< 过期；> 可执行
+        res, _ = core.process(payload("e", [tx("h", "A", 0, 3, deadline=10)], block=10))
+        self.assertEqual(res["order"], ["h"])
+        self.assertEqual(res["dropped"], [])
+
+        res, _ = core.process(payload("l", [tx("h", "A", 0, 3, deadline=9)], block=10))
+        self.assertEqual(res["order"], [])
+        self.assertEqual(res["kept"], [])
+        self.assertEqual(res["dropped"], ["h"])
+        self.assertEqual(
+            res["rollback"],
+            [{"hash": "h", "at": 0, "reason": "DEADLINE_EXPIRED"}],
+        )
+
+        res, _ = core.process(payload("g", [tx("h", "A", 0, 3, deadline=11)], block=10))
+        self.assertEqual(res["order"], ["h"])
+
+    def test_expired_beats_revert_and_dependent_nonce(self):
+        # 过期交易即使 revert 也只记 DEADLINE_EXPIRED，且不参与 max nonce 统计
+        res, _ = core.process(payload("p", [
+            tx("s0", "S", 0, 10, deadline=100),
+            tx("s2", "S", 2, 10, sim="revert", deadline=5),
+        ], block=10))
+        self.assertEqual(res["order"], ["s0"])
+        self.assertEqual(
+            res["rollback"],
+            [{"hash": "s2", "at": 1, "reason": "DEADLINE_EXPIRED"}],
+        )
+
+    def test_other_txs_keep_reason_precedence(self):
+        # 过期者只记过期；未过期者之间仍 REVERT 优先于 DEPENDENT_NONCE
+        res, _ = core.process(payload("p", [
+            tx("x0", "X", 0, 10, deadline=5),   # 过期
+            tx("x1", "X", 1, 10),               # 下方存在更大 nonce 2
+            tx("x2", "X", 2, 1, sim="revert"),
+        ], block=10))
+        self.assertEqual(
+            [e["reason"] for e in res["rollback"]],
+            ["DEADLINE_EXPIRED", "DEPENDENT_NONCE", "REVERT"],
+        )
+        self.assertEqual(res["dropped"],
+                         [e["hash"] for e in res["rollback"]])
+
+    def test_any_leg_expired_breaks_hit(self):
+        # 无新字段时仍是夹子
+        res, _ = core.process(self.sandwich())
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(len(res["hits"]), 1)
+
+        for leg, only, at in ((0, "f", 0), (2, "b", 2)):
+            dl = [None, None, None]
+            dl[leg] = 5
+            res, err = core.process(self.sandwich(dl, block=10))
+            with self.subTest(leg=leg):
+                self.assertIsNone(err)
+                self.assertEqual(res["status"], "ok")
+                self.assertEqual(res["hits"], [])
+                self.assertEqual(res["dropped"], [only])
+                self.assertEqual(res["rollback"], [
+                    {"hash": only, "at": at, "reason": "DEADLINE_EXPIRED"}])
+
+        # victim 过期：不成命中；f 按既有 DEPENDENT_NONCE 规则回滚
+        res, _ = core.process(self.sandwich((None, 5, None), block=10))
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["hits"], [])
+        self.assertEqual(res["order"], ["b"])
+        self.assertEqual(
+            [e["reason"] for e in res["rollback"]],
+            ["DEPENDENT_NONCE", "DEADLINE_EXPIRED"],
+        )
+
+    def test_expired_sell_revert_only_expired(self):
+        raw = payload("s", [
+            tx("f", "MEV", 0, 10, side="buy"),
+            tx("v", "USER", 0, 5, side="buy"),
+            tx("b", "MEV", 1, 10, side="sell", sim="revert", deadline=5),
+        ], block=10)
+        res, _ = core.process(raw)
+        self.assertEqual(res["hits"], [])
+        self.assertEqual(res["rollback"][-1]["reason"], "DEADLINE_EXPIRED")
+
+    def test_remaining_txs_still_produce_hits(self):
+        # (buy,过期victim,sell) 不命中；(buy,正常victim,sell) 仍命中，
+        # 命中的 at 为原相对位置
+        raw = payload("m", [
+            tx("f", "M", 0, 10, side="buy"),
+            tx("vexp", "U1", 0, 5, side="buy", deadline=5),
+            tx("v2", "U2", 0, 5, side="buy"),
+            tx("b", "M", 1, 10, side="sell"),
+        ], block=10)
+        res, _ = core.process(raw)
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual([h["at"] for h in res["hits"]], [[0, 2, 3]])
+
+    def test_all_expired_is_ok(self):
+        res, _ = core.process(payload("a", [
+            tx("f", "M", 0, 1, side="buy", deadline=1),
+            tx("v", "U", 0, 1, side="buy", deadline=1),
+            tx("b", "M", 1, 1, side="sell", deadline=1),
+        ], block=100))
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["hits"], [])
+        self.assertEqual(len(res["rollback"]), 3)
+        self.assertTrue(all(e["reason"] == "DEADLINE_EXPIRED"
+                            for e in res["rollback"]))
+
+    def test_quarantine_with_expired(self):
+        raw = payload("q", [
+            tx("f", "MEV", 0, 10, side="buy"),
+            tx("v", "USER", 0, 5, side="buy"),
+            tx("b", "MEV", 1, 10, side="sell"),
+            tx("e", "OLD", 0, 2, deadline=3),
+            tx("r", "OTHER", 0, 7, sim="revert"),
+        ], policy="quarantine", block=10)
+        res, err = core.process(raw)
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual(res["code"], "SANDWICH_MITIGATED")
+        self.assertEqual([h["at"] for h in res["hits"]], [[0, 1, 2]])
+        self.assertEqual(res["order"], ["v"])
+        self.assertEqual(res["kept"], res["order"])
+        # 按输入位置合并，每笔一次
+        self.assertEqual(res["rollback"], [
+            {"hash": "f", "at": 0, "reason": "SANDWICH_DETECTED"},
+            {"hash": "b", "at": 2, "reason": "SANDWICH_DETECTED"},
+            {"hash": "e", "at": 3, "reason": "DEADLINE_EXPIRED"},
+            {"hash": "r", "at": 4, "reason": "REVERT"},
+        ])
+        self.assertEqual(res["dropped"], ["f", "b", "e", "r"])
+
+    def test_quarantine_expired_leg_no_fresh_hit_is_ok(self):
+        raw = payload("q", [
+            tx("f", "MEV", 0, 10, side="buy", deadline=5),
+            tx("v", "USER", 0, 5, side="buy"),
+            tx("b", "MEV", 1, 10, side="sell"),
+        ], policy="quarantine", block=10)
+        res, _ = core.process(raw)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["code"], "")
+        self.assertEqual(res["hits"], [])
+        self.assertEqual(res["dropped"], ["f"])
+
+    def test_bad_deadline_shape(self):
+        bad_blocks = (True, 1.5, "3", None, -1, {}, [1])
+        for value in bad_blocks:
+            with self.subTest(kind="block", value=value):
+                raw = json.dumps({"id": "z", "transactions": [], "block": value})
+                res, err = core.process(raw)
+                self.assertEqual(err, "BAD_DEADLINE")
+                self.assertEqual(res["status"], "error")
+                self.assertEqual(res["code"], "BAD_DEADLINE")
+                self.assertEqual(res["id"], "z")
+                for k in ("order", "hits", "rollback", "kept", "dropped"):
+                    self.assertEqual(res[k], [])
+                self.assertEqual(list(res.keys()),
+                                 ["id", "status", "code", "order", "hits",
+                                  "rollback", "kept", "dropped"])
+
+        good = {"hash": "h", "from": "A", "nonce": 0, "fee": 1,
+                "token": "t", "side": "buy", "sim": "success"}
+        for value in (True, 2.0, "x", None, -1):
+            with self.subTest(kind="deadline", value=value):
+                t = dict(good, deadline=value)
+                raw = json.dumps({"id": "z", "block": 5, "transactions": [t]})
+                res, err = core.process(raw)
+                self.assertEqual(err, "BAD_DEADLINE")
+                self.assertEqual(res["code"], "BAD_DEADLINE")
+
+        # 有 deadline 无 block
+        t = dict(good, deadline=5)
+        res, err = core.process(json.dumps({"id": "z", "transactions": [t]}))
+        self.assertEqual(err, "BAD_DEADLINE")
+
+    def test_legacy_errors_take_priority(self):
+        cases = [
+            ("BAD_SCHEMA", {"id": "z", "block": "nope",
+                            "transactions": [{"hash": "h"}]}),
+            ("DUP_HASH", {"id": "z", "block": "bad", "transactions":
+                          [tx("d", "A", 0, 1), tx("d", "B", 0, 1)]}),
+            ("DUP_NONCE", {"id": "z", "transactions":
+                           [tx("a", "A", 0, 1, deadline=9),
+                            tx("b", "A", 0, 1)]}),
+            ("BAD_SIDE", {"id": "z", "block": 5, "transactions":
+                          [tx("h", "A", 0, 1, side="x", deadline=True)]}),
+            ("BAD_SIM", {"id": "z", "transactions":
+                         [tx("h", "A", 0, 1, sim="x", deadline=1)]}),
+            ("BAD_POLICY", {"id": "z", "transactions": [],
+                            "policy": "x", "block": "bad"}),
+        ]
+        for code, data in cases:
+            with self.subTest(code=code):
+                _, err = core.process(json.dumps(data))
+                self.assertEqual(err, code)
+
+    def test_cli_bad_deadline_exit_two(self):
+        sin = io.BytesIO(json.dumps(
+            {"id": "cli", "transactions": [], "block": -1}).encode())
+        sout, serr = io.BytesIO(), io.StringIO()
+        code = run([], stdin_buffer=sin, stdout_buffer=sout, stderr=serr)
+        self.assertEqual(code, 2)
+        self.assertEqual(serr.getvalue(), "BAD_DEADLINE\n")
+        parsed = json.loads(sout.getvalue())
+        self.assertEqual(parsed["code"], "BAD_DEADLINE")
+        self.assertEqual(parsed["id"], "cli")
+
+    def test_cli_valid_deadline_exit_zero(self):
+        sin = io.BytesIO(
+            payload("ok", [tx("h", "A", 0, 1, deadline=10)], block=10).encode())
+        sout, serr = io.BytesIO(), io.StringIO()
+        code = run([], stdin_buffer=sin, stdout_buffer=sout, stderr=serr)
+        self.assertEqual(code, 0)
+        self.assertEqual(serr.getvalue(), "")
+        self.assertEqual(json.loads(sout.getvalue())["order"], ["h"])
 
 
 class TestPolicy(unittest.TestCase):
