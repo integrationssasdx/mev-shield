@@ -13,6 +13,7 @@ DUP_NONCE = "DUP_NONCE"
 BAD_SIDE = "BAD_SIDE"
 BAD_SIM = "BAD_SIM"
 BAD_POLICY = "BAD_POLICY"
+BAD_DEADLINE = "BAD_DEADLINE"
 BAD_ARGS = "BAD_ARGS"
 INPUT_IO = "INPUT_IO"
 OUTPUT_IO = "OUTPUT_IO"
@@ -22,6 +23,7 @@ SANDWICH_DETECTED = "SANDWICH_DETECTED"
 SANDWICH_MITIGATED = "SANDWICH_MITIGATED"
 REVERT = "REVERT"
 DEPENDENT_NONCE = "DEPENDENT_NONCE"
+DEADLINE_EXPIRED = "DEADLINE_EXPIRED"
 
 # 可选保护策略；缺省等价于 reject
 POLICY_REJECT = "reject"
@@ -47,7 +49,12 @@ def _is_nonneg_int(value):
 
 
 def parse_input(raw):
-    """解析并校验输入，返回 (id, transactions, policy)；失败抛 ShieldError。"""
+    """解析并校验输入，返回 (id, transactions, policy, block)；失败抛 ShieldError。
+
+    可选区块期限字段：批次级 block（当前区块高度）与交易级 deadline
+    （最后可执行区块），均须为非负整数（排除布尔值）。原输入全部有效后
+    才校验这两个字段；类型错误或有 deadline 无 block 时抛 BAD_DEADLINE。
+    """
     try:
         data = json.loads(raw)
     except ValueError:
@@ -70,6 +77,8 @@ def parse_input(raw):
     seen_hash = set()
     # from -> 已出现的 nonce 集合
     seen_nonce = {}
+    # 每笔交易的 deadline 原始值（缺省为 None），待原字段校验全部通过后统一检查
+    raw_deadlines = []
 
     for tx in txs:
         if not isinstance(tx, dict):
@@ -115,10 +124,26 @@ def parse_input(raw):
                 "token": token,
                 "side": side,
                 "sim": sim,
+                "deadline": None,
             }
         )
+        raw_deadlines.append(tx["deadline"] if "deadline" in tx else None)
 
-    return data["id"], parsed, policy
+    # 区块期限字段：仅在原输入全部有效后校验，错误一律 BAD_DEADLINE
+    block = data.get("block")
+    if "block" in data:
+        if not _is_nonneg_int(block):
+            raise ShieldError(BAD_DEADLINE)
+    else:
+        block = None
+    for at, tx in enumerate(txs):
+        if "deadline" not in tx:
+            continue
+        if block is None or not _is_nonneg_int(raw_deadlines[at]):
+            raise ShieldError(BAD_DEADLINE)
+        parsed[at]["deadline"] = raw_deadlines[at]
+
+    return data["id"], parsed, policy, block
 
 
 def peek_id(raw):
@@ -165,13 +190,15 @@ def detect_sandwiches(txs):
     return hits
 
 
-def build_no_sandwich(txs):
-    """无夹子时：排除 revert 与同 from 中 nonce 更大的交易，其余排序打包。
+def build_no_sandwich(txs, expired=()):
+    """无夹子时：排除过期、revert 与同 from 中 nonce 更大的交易，其余排序打包。
 
-    返回 (order, rollback, kept, dropped)：
+    expired 为过期交易的输入位置集合。返回 (order, rollback, kept, dropped)：
     rollback 按原位置记录；order/kept 按 fee 降序、hash 升序；
     dropped 按原位置保存被排除的 hash。
+    原因优先级：DEADLINE_EXPIRED -> REVERT -> DEPENDENT_NONCE。
     """
+    expired = set(expired)
     # 每个 from 的最大 nonce
     max_nonce = {}
     for tx in txs:
@@ -182,7 +209,9 @@ def build_no_sandwich(txs):
     rollback = []
     survivors = []
     for at, tx in enumerate(txs):
-        if tx["sim"] == "revert":
+        if at in expired:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": DEADLINE_EXPIRED})
+        elif tx["sim"] == "revert":
             rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
         elif tx["nonce"] < max_nonce[tx["from"]]:
             rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
@@ -195,15 +224,17 @@ def build_no_sandwich(txs):
     return order, rollback, order[:], dropped
 
 
-def build_quarantine(txs, hits_idx):
+def build_quarantine(txs, hits_idx, expired=()):
     """quarantine 策略：隔离全部命中的 buy/sell 攻击腿，保留 victim 及其余交易。
 
-    返回 (order, rollback, kept, dropped)，约定同 build_no_sandwich。
-    未进 order 的交易只记一次 rollback，原因优先级：
-    SANDWICH_DETECTED（攻击腿） -> REVERT -> DEPENDENT_NONCE
-    （后两者在隔离后的剩余交易集合上判定）。
+    expired 为过期交易的输入位置集合。返回 (order, rollback, kept, dropped)，
+    约定同 build_no_sandwich。未进 order 的交易只记一次 rollback，原因优先级：
+    SANDWICH_DETECTED（攻击腿） -> DEADLINE_EXPIRED -> REVERT -> DEPENDENT_NONCE
+    （后两者在隔离后的剩余交易集合上判定；攻击腿由未过期命中构成，
+    与过期集合互不相交）。
     攻击腿全部移除后，剩余交易按输入相对顺序不再含可识别夹子。
     """
+    expired = set(expired)
     attack = set()
     for (i, _j, k) in hits_idx:
         attack.add(i)
@@ -223,6 +254,8 @@ def build_quarantine(txs, hits_idx):
     for at, tx in enumerate(txs):
         if at in attack:
             rollback.append({"hash": tx["hash"], "at": at, "reason": SANDWICH_DETECTED})
+        elif at in expired:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": DEADLINE_EXPIRED})
         elif tx["sim"] == "revert":
             rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
         elif tx["nonce"] < max_nonce[tx["from"]]:
@@ -252,11 +285,25 @@ def error_result(ident, code):
 def process(raw):
     """处理输入文本，返回 (result_dict, error_code_or_None)。"""
     try:
-        ident, txs, policy = parse_input(raw)
+        ident, txs, policy, block = parse_input(raw)
     except ShieldError as exc:
         return error_result(peek_id(raw), exc.code), exc.code
 
-    hits_idx = detect_sandwiches(txs)
+    # 过期交易：deadline 小于当前区块高度；不参与夹子识别、order 或 kept
+    expired = set()
+    if block is not None:
+        for at, tx in enumerate(txs):
+            deadline = tx["deadline"]
+            if deadline is not None and deadline < block:
+                expired.add(at)
+
+    # 夹子检测只使用未过期交易的原相对位置；hits 的 at 记录输入位置
+    active_idx = [at for at in range(len(txs)) if at not in expired]
+    active_txs = [txs[at] for at in active_idx]
+    hits_idx = [
+        (active_idx[i], active_idx[j], active_idx[k])
+        for (i, j, k) in detect_sandwiches(active_txs)
+    ]
     hits = [
         {
             "buy": txs[i]["hash"],
@@ -270,7 +317,7 @@ def process(raw):
 
     if policy == POLICY_QUARANTINE:
         if hits_idx:
-            order, rollback, kept, dropped = build_quarantine(txs, hits_idx)
+            order, rollback, kept, dropped = build_quarantine(txs, hits_idx, expired)
             result = {
                 "id": ident,
                 "status": "mitigated",
@@ -296,7 +343,7 @@ def process(raw):
         }
         return result, None
 
-    order, rollback, kept, dropped = build_no_sandwich(txs)
+    order, rollback, kept, dropped = build_no_sandwich(txs, expired)
     result = {
         "id": ident,
         "status": "ok",
