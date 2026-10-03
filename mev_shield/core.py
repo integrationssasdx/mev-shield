@@ -12,14 +12,20 @@ DUP_HASH = "DUP_HASH"
 DUP_NONCE = "DUP_NONCE"
 BAD_SIDE = "BAD_SIDE"
 BAD_SIM = "BAD_SIM"
+BAD_POLICY = "BAD_POLICY"
 BAD_ARGS = "BAD_ARGS"
 INPUT_IO = "INPUT_IO"
 OUTPUT_IO = "OUTPUT_IO"
 
 # 业务状态码 / 回滚原因
 SANDWICH_DETECTED = "SANDWICH_DETECTED"
+SANDWICH_MITIGATED = "SANDWICH_MITIGATED"
 REVERT = "REVERT"
 DEPENDENT_NONCE = "DEPENDENT_NONCE"
+
+# 可选保护策略；缺省等价于 reject
+POLICY_REJECT = "reject"
+POLICY_QUARANTINE = "quarantine"
 
 # 固定输出键顺序
 RESULT_KEYS = ("id", "status", "code", "order", "hits", "rollback", "kept", "dropped")
@@ -41,7 +47,7 @@ def _is_nonneg_int(value):
 
 
 def parse_input(raw):
-    """解析并校验输入，返回 (id, transactions)；失败抛 ShieldError。"""
+    """解析并校验输入，返回 (id, transactions, policy)；失败抛 ShieldError。"""
     try:
         data = json.loads(raw)
     except ValueError:
@@ -54,6 +60,11 @@ def parse_input(raw):
     txs = data.get("transactions")
     if not isinstance(txs, list):
         raise ShieldError(BAD_SCHEMA)
+
+    # 可选策略：缺省等价 reject；只接受 reject / quarantine
+    policy = data.get("policy", POLICY_REJECT)
+    if policy not in (POLICY_REJECT, POLICY_QUARANTINE):
+        raise ShieldError(BAD_POLICY)
 
     parsed = []
     seen_hash = set()
@@ -107,7 +118,7 @@ def parse_input(raw):
             }
         )
 
-    return data["id"], parsed
+    return data["id"], parsed, policy
 
 
 def peek_id(raw):
@@ -184,6 +195,47 @@ def build_no_sandwich(txs):
     return order, rollback, order[:], dropped
 
 
+def build_quarantine(txs, hits_idx):
+    """quarantine 策略：隔离全部命中的 buy/sell 攻击腿，保留 victim 及其余交易。
+
+    返回 (order, rollback, kept, dropped)，约定同 build_no_sandwich。
+    未进 order 的交易只记一次 rollback，原因优先级：
+    SANDWICH_DETECTED（攻击腿） -> REVERT -> DEPENDENT_NONCE
+    （后两者在隔离后的剩余交易集合上判定）。
+    攻击腿全部移除后，剩余交易按输入相对顺序不再含可识别夹子。
+    """
+    attack = set()
+    for (i, _j, k) in hits_idx:
+        attack.add(i)
+        attack.add(k)
+
+    # 剩余交易每个 from 的最大 nonce
+    max_nonce = {}
+    for at, tx in enumerate(txs):
+        if at in attack:
+            continue
+        sender = tx["from"]
+        if sender not in max_nonce or tx["nonce"] > max_nonce[sender]:
+            max_nonce[sender] = tx["nonce"]
+
+    rollback = []
+    survivors = []
+    for at, tx in enumerate(txs):
+        if at in attack:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": SANDWICH_DETECTED})
+        elif tx["sim"] == "revert":
+            rollback.append({"hash": tx["hash"], "at": at, "reason": REVERT})
+        elif tx["nonce"] < max_nonce[tx["from"]]:
+            rollback.append({"hash": tx["hash"], "at": at, "reason": DEPENDENT_NONCE})
+        else:
+            survivors.append(tx)
+
+    survivors.sort(key=lambda tx: (-tx["fee"], tx["hash"]))
+    order = [tx["hash"] for tx in survivors]
+    dropped = [entry["hash"] for entry in rollback]
+    return order, rollback, order[:], dropped
+
+
 def error_result(ident, code):
     return {
         "id": ident,
@@ -200,22 +252,38 @@ def error_result(ident, code):
 def process(raw):
     """处理输入文本，返回 (result_dict, error_code_or_None)。"""
     try:
-        ident, txs = parse_input(raw)
+        ident, txs, policy = parse_input(raw)
     except ShieldError as exc:
         return error_result(peek_id(raw), exc.code), exc.code
 
     hits_idx = detect_sandwiches(txs)
-    if hits_idx:
-        hits = [
-            {
-                "buy": txs[i]["hash"],
-                "victim": txs[j]["hash"],
-                "sell": txs[k]["hash"],
-                "token": txs[i]["token"],
-                "at": [i, j, k],
+    hits = [
+        {
+            "buy": txs[i]["hash"],
+            "victim": txs[j]["hash"],
+            "sell": txs[k]["hash"],
+            "token": txs[i]["token"],
+            "at": [i, j, k],
+        }
+        for (i, j, k) in hits_idx
+    ]
+
+    if policy == POLICY_QUARANTINE:
+        if hits_idx:
+            order, rollback, kept, dropped = build_quarantine(txs, hits_idx)
+            result = {
+                "id": ident,
+                "status": "mitigated",
+                "code": SANDWICH_MITIGATED,
+                "order": order,
+                "hits": hits,
+                "rollback": rollback,
+                "kept": kept,
+                "dropped": dropped,
             }
-            for (i, j, k) in hits_idx
-        ]
+            return result, None
+        # 无命中：与缺省路径一致走 ok 结果
+    elif hits_idx:
         result = {
             "id": ident,
             "status": "rejected",
