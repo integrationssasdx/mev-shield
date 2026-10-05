@@ -9,8 +9,8 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 ## 状态
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
-fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口
-与最小隔离计划。
+fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
+最小隔离计划与预算约束隔离计划。
 
 ## 夹子检测
 
@@ -172,6 +172,37 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 输入校验失败退出 2、stderr 写原因码，stdout 仍输出上述固定字段，但
 四个列表（`baselineOrder`、`selectedOrder`、`removed`、`evidence`）
 为空、`keptFee` 与 `removedFee` 为 0；正常退出 0。
+
+## 预算约束隔离计划（python -m mev_shield.bounded）
+
+在统一决策入口的输入、校验与相邻三段夹子规则之上，从交易包的全部
+子集中选出一个合法的隔离保留集合，且被移除笔数不超过批次级预算。
+参数与既有入口相同（仅 `--input` / `--output`，缺省标准输入 /
+标准输出），不新增落盘要求；既有入口的输入、输出与退出码不变。
+
+- 输入在统一决策入口的根对象上新增必需字段 `isolationLimit`：最多
+  移除笔数，非负 JSON 整数（排除布尔值）。缺失、类型错误、布尔值
+  或小于零均返回 `BAD_ISOLATION_LIMIT`；该校验排在统一决策入口
+  全部既有校验（含 `BAD_SLIPPAGE_MODE`）之后，旧错误一律优先。
+- 基线顺序、合法性（无相邻三段夹子证据、同 `from` nonce 严格递增）
+  与择优目标（保留 fee 总和最高、保留笔数最多、被移除交易按输入
+  位置的 hash 序列字典序最小）沿用最小隔离计划，另要求被移除笔数
+  不超过 `isolationLimit`；枚举预算内全部子集求全局最优。
+
+输出字段固定：`id`、`baselineOrder`、`selectedOrder`、`removed`
+（按输入位置列出 `hash`、`at` 与固定原因 `SANDWICH_REMOVED`）、
+`keptFee`、`removedFee`、`evidence`（完整基线的全部夹子证据，按
+起始位置升序、同位按 victim hash 升序）、`feasible`、
+`isolationLimit`。相同输入逐字一致。
+
+- `feasible` 为 true 时：`selectedOrder` 与 `removed` 不重不漏覆盖
+  输入交易，`keptFee` 与 `removedFee` 之和等于输入 fee 总和。
+- 预算内无解不是输入错误：退出 0，`feasible` 为 false，
+  `selectedOrder` 与 `removed` 为空，`keptFee` 与 `removedFee`
+  为 0，`baselineOrder` 与 `evidence` 仍取完整基线，stderr 不写码。
+- 输入校验失败退出 2、stderr 写原因码，stdout 保持同形：
+  `feasible` 为 false，四个列表为空，`keptFee`、`removedFee` 与
+  `isolationLimit` 为 0。
 
 ## 约定
 
