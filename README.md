@@ -64,6 +64,63 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
   `DEPENDENT_NONCE`；每笔交易只记一次。`rollback` / `dropped`
   按输入位置排列，`order` 与 `kept` 同序。
 
+## 统一决策入口（python -m mev_shield.decision）
+
+在既有能力之上提供单交易包的统一结论；`python -m mev_shield`
+入口与公开行为不变。参数与既有入口相同（`--input` / `--output`，
+缺省标准输入 / 标准输出）。
+
+输入（JSON 对象）：
+
+- `id`：交易包标识，字符串；
+- `transactions`：候选交易（数组顺序即候选顺序），每笔含
+  `hash` / `from` / `nonce` / `fee` / `token` / `side` / `sim` /
+  `price`（正数执行价）；
+- `market`：市场上下文，对象，含 `prices`（token -> 正数参考价）；
+- `basePrice`：基准价格，正数；
+- `maxSlippage`：滑点上限，`[0, 1]` 含端点；
+- `rollbackLimit`：回滚范围，`[0, 1]` 含端点；
+- `policy`：可选策略，`reject`（缺省）/ `quarantine`。
+
+处理流程：先校验交易包、顺序与市场上下文；沿用既有 fee 排序
+语义（fee 降序、hash 升序）生成最终顺序，最终顺序恰好覆盖输入
+交易，不增加、丢失或重复；在最终顺序上以相邻交易的价格变化、
+买卖方向和发送者识别三段夹子（首尾同 `from` 为前置 / 后置腿，
+中间不同 `from` 为受害交易，价格沿受害方向移动且在后置腿回落），
+并输出位置、价格与变化率 `move` 作为可复核依据。
+
+输出字段固定：`id`、`conclusion`（`ALLOW` / `BLOCK`）、
+`finalOrder`、`sandwich`（`detected` / `front` / `victim` /
+`back` / `evidence`）、`involved`（涉及交易，按最终顺序）、
+`reasons`（原因码，固定优先级排列）、`rollbackAllowed`、
+`basis`（决策依据：策略、限额与实测值）。相同输入逐字一致。
+
+- 正常放行：`ALLOW` 且 `rollbackAllowed` 为 `true`，`reasons` 为空。
+- 风险检查失败（滑点超限 `SLIPPAGE_EXCEEDED`）、价格上下文缺失
+  （`PRICE_CONTEXT_MISSING`，token 无参考价）、排序不满足 nonce
+  依赖（`NONCE_ORDER_VIOLATION`）、预计回滚（`sim` 为 `revert`
+  的占比）超过范围（`ROLLBACK_LIMIT_EXCEEDED`）或确认夹子
+  （`SANDWICH_DETECTED`）：结论 `BLOCK` 且 `rollbackAllowed` 为
+  `false`。业务结论（含 BLOCK）退出码为 0。
+- 回滚决策失败关闭：检测器、排序器或回滚评估不可用时分别记
+  `DETECTION_UNAVAILABLE`、`ORDERING_UNAVAILABLE`、
+  `ROLLBACK_EVALUATION_FAILED`，结论一律 `BLOCK` 且
+  `rollbackAllowed` 为 `false`。
+
+输入校验失败（退出码 2，stderr 输出错误码）只返回对应原因码，
+结论为 `BLOCK`，不夹带允许结论。校验优先级固定：
+
+1. 空交易包：`EMPTY_BUNDLE`；
+2. 缺少可识别哈希（缺失、非字符串或为空）：`UNIDENTIFIED_TRANSACTION`；
+3. 重复交易（hash 重复）：`DUPLICATE_TRANSACTION`；
+4. 无法满足的相邻 nonce 依赖（同 `from` nonce 重复或不连续）：
+   `ORDERING_CONFLICT`；
+5. 缺少价格字段（缺 `market.prices` 或交易缺正数 `price`）：
+   `MISSING_MARKET_CONTEXT`；
+6. 非正基准价格：`INVALID_PRICE_BASE`；
+7. 滑点上限不在 `[0, 1]`：`INVALID_RISK_LIMIT`；
+8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`。
+
 ## 约定
 
 - 公开行为以 README 与源码为准。
