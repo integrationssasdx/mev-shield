@@ -8,8 +8,31 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 ## 状态
 
-已实现：JSON 批处理校验、夹子检测、reject / quarantine 策略、
+已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
+
+## 夹子检测
+
+对原输入顺序枚举所有 `i<j<k`：三笔交易 `token` 相同、`sim` 均为
+`success`、`i` 与 `k` 同 `from`、`j` 的 `from` 与之不同，且：
+
+- 正向夹子：`i` 与 `j` 为 `buy`、`k` 为 `sell`（攻击者先买、victim
+  买、攻击者后卖）；
+- 反向夹子：`i` 与 `j` 为 `sell`、`k` 为 `buy`（攻击者先卖、victim
+  卖、攻击者后买）。
+
+过期交易先排除且不参与命中。命中逐条保留（含重叠），按攻击前置腿
+位置 `i` 升序排列。每条命中输出固定键 `buy`、`victim`、`sell`、
+`token`、`at`：`buy` / `sell` 固定表示攻击者的买入腿与卖出腿，
+`victim` 为中间交易，`at` 按字段顺序记录三者的输入位置。因此反向
+夹子中 `buy` 的位置晚于 `sell`（`at[0] > at[2]`）。
+
+- reject（含缺省策略）：任一命中返回 `rejected` /
+  `SANDWICH_DETECTED`，`order`、`rollback`、`kept`、`dropped` 均空。
+- quarantine：有命中时返回 `mitigated` / `SANDWICH_MITIGATED`，
+  隔离所有攻击腿（每笔只记一次 `SANDWICH_DETECTED` 回滚），victim
+  及其余交易继续按 deadline、sim、nonce 规则筛选；无命中时为
+  `ok` 且 `code` 为空。
 
 ## 区块期限
 

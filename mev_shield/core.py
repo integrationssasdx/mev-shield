@@ -174,19 +174,24 @@ def peek_id(raw):
 def detect_sandwiches(txs):
     """返回命中三元组 (i, j, k) 列表，按 (i, j, k) 升序。
 
-    对 i<j<k：i、k 同 from，i 为 buy、k 为 sell；j 不同 from 且为 buy；
-    token 相同且三者 sim 均为 success。
+    对 i<j<k：i、k 同 from，j 不同 from，三者 token 相同且 sim 均为
+    success。i 恒为攻击者前置腿，k 为攻击者后置腿：
+    - 正向夹子：i 为 buy、j 为 buy、k 为 sell（攻击者先买后卖）；
+    - 反向夹子：i 为 sell、j 为 sell、k 为 buy（攻击者先卖后买）。
     """
     hits = []
     n = len(txs)
     for i in range(n - 2):
         ti = txs[i]
-        if ti["side"] != "buy" or ti["sim"] != "success":
+        if ti["sim"] != "success":
             continue
+        # victim 与前置腿同向，后置腿为另一方向
+        front_side = ti["side"]
+        back_side = "sell" if front_side == "buy" else "buy"
         for j in range(i + 1, n - 1):
             tj = txs[j]
             if (
-                tj["side"] != "buy"
+                tj["side"] != front_side
                 or tj["sim"] != "success"
                 or tj["from"] == ti["from"]
                 or tj["token"] != ti["token"]
@@ -195,7 +200,7 @@ def detect_sandwiches(txs):
             for k in range(j + 1, n):
                 tk = txs[k]
                 if (
-                    tk["side"] == "sell"
+                    tk["side"] == back_side
                     and tk["sim"] == "success"
                     and tk["from"] == ti["from"]
                     and tk["token"] == ti["token"]
@@ -379,16 +384,24 @@ def process(raw):
         (active_idx[i], active_idx[j], active_idx[k])
         for (i, j, k) in detect_sandwiches(active_txs)
     ]
-    hits = [
-        {
-            "buy": txs[i]["hash"],
-            "victim": txs[j]["hash"],
-            "sell": txs[k]["hash"],
-            "token": txs[i]["token"],
-            "at": [i, j, k],
-        }
-        for (i, j, k) in hits_idx
-    ]
+    hits = []
+    for (i, j, k) in hits_idx:
+        # buy/sell 固定为攻击者的买入腿与卖出腿；正向（i 买 k 卖）时
+        # at=[i,j,k]，反向（i 卖 k 买）时买腿在 k，at=[k,j,i]，
+        # 故反向夹子里 buy 的位置晚于 sell。
+        if txs[i]["side"] == "buy":
+            buy_at, sell_at = i, k
+        else:
+            buy_at, sell_at = k, i
+        hits.append(
+            {
+                "buy": txs[buy_at]["hash"],
+                "victim": txs[j]["hash"],
+                "sell": txs[sell_at]["hash"],
+                "token": txs[i]["token"],
+                "at": [buy_at, j, sell_at],
+            }
+        )
 
     if policy == POLICY_QUARANTINE:
         if hits_idx:
