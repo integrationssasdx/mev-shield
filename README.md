@@ -9,8 +9,8 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 ## 状态
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
-fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口
-与最小隔离计划。
+fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
+最小隔离计划与预算约束隔离计划。
 
 ## 夹子检测
 
@@ -172,6 +172,45 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 输入校验失败退出 2、stderr 写原因码，stdout 仍输出上述固定字段，但
 四个列表（`baselineOrder`、`selectedOrder`、`removed`、`evidence`）
 为空、`keptFee` 与 `removedFee` 为 0；正常退出 0。
+
+## 预算约束隔离计划（python -m mev_shield.bounded）
+
+在最小隔离计划的输入、校验、fee 降序 hash 升序基线、相邻三段夹子
+规则与同 `from` nonce 严格递增约束之上，新增最多移除笔数预算
+`isolationLimit`。参数与既有入口相同（仅 `--input` / `--output`，
+缺省标准输入 / 标准输出），不新增落盘要求；两个既有入口的输入、
+输出与退出码不变。
+
+- 输入同统一决策入口，根对象新增**必需** `isolationLimit`：最多
+  移除笔数，必须是非负 JSON 整数（排除布尔值）。缺失、类型错误、
+  布尔值或小于零一律返回 `BAD_ISOLATION_LIMIT`；该校验排在统一决策
+  入口全部既有校验（含 `BAD_SLIPPAGE_MODE`）之后，任何既有错误码
+  均优先。
+- 沿用 fee 降序、hash 升序生成 `baselineOrder` 后枚举保留集合；
+  合法性同最小隔离计划（按基线相对顺序无夹子证据、同 `from` nonce
+  严格递增），且被移除笔数不超过 `isolationLimit`。空集虽恒合法，
+  但其移除数为全部笔数，可能超出预算——此时预算内无可行解。
+- 枚举全部子集求全局最优（不逐笔贪心），择优目标依次为：保留 fee
+  总和最高、保留笔数最多、被移除交易按输入位置形成的 hash 序列
+  字典序最小；结果确定。
+
+输出字段固定：`id`、`baselineOrder`、`selectedOrder`、`removed`
+（按输入位置列出每笔被移除交易的 `hash`、`at` 与固定原因
+`SANDWICH_REMOVED`）、`keptFee`、`removedFee`、`evidence`（完整
+基线的全部夹子证据，按起始位置升序、同位按 victim hash 升序）、
+`feasible`、`isolationLimit`。
+
+- `feasible` 为 `true` 时 `selectedOrder` 与 `removed` 不重不漏
+  覆盖输入，`keptFee` 与 `removedFee` 之和等于输入 fee 总和。
+- 预算内无可行解时退出 0（不写 stderr），`feasible` 为 `false`、
+  `selectedOrder` 与 `removed` 为空、`keptFee` 与 `removedFee`
+  为 0；`baselineOrder` 与 `evidence` 仍取完整基线，`isolationLimit`
+  回显输入预算。
+- 输入校验失败退出 2、stderr 写原因码，stdout 保持同形：`feasible`
+  为 `false`，四个列表（`baselineOrder`、`selectedOrder`、`removed`、
+  `evidence`）为空，`keptFee`、`removedFee`、`isolationLimit` 为 0。
+  `BAD_ARGS`、`INPUT_IO`、`OUTPUT_IO` 沿用现有约定；输出不可写时
+  保留更高优先级错误码。
 
 ## 约定
 
