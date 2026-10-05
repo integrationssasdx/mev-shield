@@ -121,6 +121,41 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
 7. 滑点上限不在 `[0, 1]`：`INVALID_RISK_LIMIT`；
 8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`。
 
+## 最小隔离计划（python -m mev_shield.mitigation）
+
+在统一决策入口的输入语义之上，为单个交易包求全局最优的最小隔离
+集合；`python -m mev_shield` 与 `python -m mev_shield.decision`
+入口及公开行为不变。参数仅接受 `--input` / `--output`，缺省标准
+输入 / 标准输出。
+
+输入沿用统一决策入口的交易包、市场价格、风险限额及 JSON、哈希、
+nonce、价格、策略与校验语义（校验优先级与错误码完全一致），不
+新增落盘要求。
+
+处理流程：
+
+- 先按既有 fee 降序、hash 升序生成基线顺序（`baselineOrder`）；
+- 从全部子集中选出一个保留集合（不逐笔贪心，精确枚举）；对保留
+  集合（相对顺序与基线一致）执行与统一入口完全相同的相邻三段
+  夹子判定——移除中间交易后新相邻的三笔同样按该规则判定；仅当
+  无夹子且同发送者保留交易 nonce 严格递增（允许跳号）时集合合法；
+- 优化目标依次为：保留 fee 总和最高 -> 保留笔数最多 -> 被移除
+  交易按输入位置形成的 hash 序列字典序最小。重叠或互相牵连的
+  夹子同样得到全局最优隔离集合（如共享攻击腿由一笔移除同时
+  化解；移除某腿后重新相邻仍成夹子的情形也不会被误判为合法）。
+
+输出字段固定：`id`、`baselineOrder`（全部交易基线顺序）、
+`selectedOrder`（最优保留集合顺序）、`removed`（按输入位置列出
+每笔被移除交易的 `hash` / `at` / `SANDWICH_REMOVED`）、
+`keptFee` / `removedFee`（相应 fee 总和）、`evidence`（基线顺序
+按统一夹子规则得到的全部证据，按起始位置升序、同位按 victim
+hash 升序，结构与决策入口的 evidence 一致）。相同输入逐字一致。
+
+- 正常退出 0；无夹子时保留全部交易。
+- 输入校验失败退出 2，stderr 写原因码；stdout 仍输出固定字段，
+  但 `baselineOrder` / `selectedOrder` / `removed` / `evidence`
+  为空、`keptFee` / `removedFee` 为 0。
+
 ## 约定
 
 - 公开行为以 README 与源码为准。
