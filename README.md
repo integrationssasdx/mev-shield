@@ -9,7 +9,8 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 ## 状态
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
-fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
+fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口
+与最小隔离计划。
 
 ## 夹子检测
 
@@ -120,6 +121,33 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护。
 6. 非正基准价格：`INVALID_PRICE_BASE`；
 7. 滑点上限不在 `[0, 1]`：`INVALID_RISK_LIMIT`；
 8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`。
+
+## 最小隔离计划（python -m mev_shield.mitigation）
+
+在统一决策入口的输入、校验与相邻三段夹子规则之上，从交易包的全部
+子集中选出一个合法的最小隔离保留集合。参数与既有入口相同（仅
+`--input` / `--output`，缺省标准输入 / 标准输出），不新增落盘要求；
+输入 JSON、哈希、nonce、价格、策略与校验语义及错误码优先级完全沿用
+统一决策入口，既有两个入口的输入、输出与退出码不变。
+
+- 基线顺序：沿用 fee 降序、hash 升序，作为 `baselineOrder`。
+- 合法性：保留集合按基线相对顺序排列后，顺序执行与统一决策入口
+  相同的相邻三段夹子判定，须无任何夹子证据；且同一 `from` 的保留
+  交易 nonce 在该顺序上严格递增。
+- 枚举全部子集求全局最优（不逐笔贪心），择优目标依次为：保留 fee
+  总和最高、保留笔数最多、被移除交易按输入位置形成的 hash 序列
+  字典序最小。重叠或互相牵连的夹子同样得到全局最优隔离集合；无夹子
+  时保留全部交易。
+
+输出字段固定：`id`、`baselineOrder`、`selectedOrder`（最优保留集合
+顺序）、`removed`（按输入位置列出每笔被移除交易的 `hash`、`at` 与
+固定原因 `SANDWICH_REMOVED`）、`keptFee`、`removedFee`（相应 fee
+总和）、`evidence`（`baselineOrder` 按统一夹子规则得到的全部证据，
+按起始位置升序、同位按 victim hash 升序）。相同输入逐字一致。
+
+输入校验失败退出 2、stderr 写原因码，stdout 仍输出上述固定字段，但
+四个列表（`baselineOrder`、`selectedOrder`、`removed`、`evidence`）
+为空、`keptFee` 与 `removedFee` 为 0；正常退出 0。
 
 ## 约定
 
