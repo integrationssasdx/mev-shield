@@ -22,7 +22,8 @@ def tx(h, frm, nonce, fee, token="TKN", side="buy", sim="success", price=100):
     }
 
 
-def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None):
+def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None,
+            mode=None):
     data = {
         "id": ident,
         "transactions": txs,
@@ -33,6 +34,8 @@ def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None):
     }
     if policy is not None:
         data["policy"] = policy
+    if mode is not None:
+        data["slippageMode"] = mode
     return json.dumps(data)
 
 
@@ -293,6 +296,22 @@ class TestInputErrors(unittest.TestCase):
         self.assert_error(json.dumps([1, 2]), "BAD_SCHEMA", ident="")
         self.assert_error(request("e", [tx("a", "A", 0, 1)], policy="x"),
                           "BAD_POLICY")
+
+    def test_bad_slippage_mode(self):
+        # 隔离入口沿用统一决策校验：非法口径退出 2
+        self.assert_error(request("e", [tx("a", "A", 0, 1)], mode="nope"),
+                          "BAD_SLIPPAGE_MODE")
+        # 排在 policy 之后：旧错误优先
+        self.assert_error(
+            request("e", [tx("a", "A", 0, 1)], policy="x", mode="nope"),
+            "BAD_POLICY")
+
+    def test_market_mode_accepted(self):
+        # market 口径不影响隔离计划：合法输入正常退出 0
+        res, err = mitigation.process(
+            request("ok", [tx("a", "A", 0, 1)], mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["selectedOrder"], ["a"])
 
 
 class TestCli(unittest.TestCase):

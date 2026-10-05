@@ -21,7 +21,8 @@ def tx(h, frm, nonce, fee, token="TKN", side="buy", sim="success", price=100):
     }
 
 
-def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None):
+def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None,
+            mode=None):
     data = {
         "id": ident,
         "transactions": txs,
@@ -32,6 +33,8 @@ def request(ident, txs, market=None, base=100, slip=0.5, rb=1, policy=None):
     }
     if policy is not None:
         data["policy"] = policy
+    if mode is not None:
+        data["slippageMode"] = mode
     return json.dumps(data)
 
 
@@ -278,6 +281,118 @@ class TestDecide(unittest.TestCase):
         self.assertNotIn(" ", out1.strip())
 
 
+class TestSlippageMode(unittest.TestCase):
+    def test_market_mode_uses_market_reference(self):
+        # base 口径相对 basePrice=100 偏离 0%；market 口径相对
+        # 市场参考价 200 偏离 50% -> BLOCK
+        txs = [tx("a", "A", 0, 1, token="TKN", price=100)]
+        market = {"prices": {"TKN": 200}}
+        res, err = decision.process(
+            request("m1", txs, market=market, base=100, slip=0.1, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["conclusion"], "BLOCK")
+        self.assertEqual(res["reasons"], ["SLIPPAGE_EXCEEDED"])
+        self.assertAlmostEqual(res["basis"]["maxSlippageObserved"], 0.5)
+        # basePrice 在 market 模式仍校验并从 basis 返回
+        self.assertEqual(res["basis"]["basePrice"], 100)
+
+    def test_market_mode_within_limit_allow(self):
+        txs = [
+            tx("a", "A", 0, 1, token="TKN", price=109),
+            tx("b", "B", 0, 2, token="TKN2", price=50),
+        ]
+        market = {"prices": {"TKN": 100, "TKN2": 50}}
+        res, err = decision.process(
+            request("m2", txs, market=market, base=100, slip=0.1, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["conclusion"], "ALLOW")
+        self.assertEqual(res["reasons"], [])
+        self.assertAlmostEqual(res["basis"]["maxSlippageObserved"], 0.09)
+
+    def test_market_mode_at_limit_allowed(self):
+        # 等于上限仍放行
+        txs = [tx("a", "A", 0, 1, token="TKN", price=110)]
+        market = {"prices": {"TKN": 100}}
+        res, err = decision.process(
+            request("m3", txs, market=market, slip=0.1, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["conclusion"], "ALLOW")
+
+    def test_market_mode_missing_reference_only(self):
+        # token 缺少参考价：只产生 PRICE_CONTEXT_MISSING，不追加滑点超限
+        txs = [
+            tx("a", "A", 0, 1, token="TKN", price=100),
+            tx("x", "B", 0, 2, token="ZZZ", price=1_000_000),
+        ]
+        market = {"prices": {"TKN": 100}}
+        res, err = decision.process(
+            request("m4", txs, market=market, slip=0.1, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["conclusion"], "BLOCK")
+        self.assertEqual(res["reasons"], ["PRICE_CONTEXT_MISSING"])
+        # 缺参考价的一笔不参与取值，max 仅来自可计算结果
+        self.assertEqual(res["basis"]["maxSlippageObserved"], 0.0)
+
+    def test_market_mode_missing_and_exceeded_priority(self):
+        # 缺参考价 + 另一笔滑点超限：两原因按固定优先级排列
+        txs = [
+            tx("a", "A", 0, 1, token="TKN", price=200),
+            tx("x", "B", 0, 2, token="ZZZ", price=1),
+        ]
+        market = {"prices": {"TKN": 100}}
+        res, err = decision.process(
+            request("m5", txs, market=market, slip=0.1, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["reasons"],
+                         ["SLIPPAGE_EXCEEDED", "PRICE_CONTEXT_MISSING"])
+        self.assertAlmostEqual(res["basis"]["maxSlippageObserved"], 1.0)
+
+    def test_market_mode_no_computable_result_zero(self):
+        # 全部缺参考价：maxSlippageObserved 为 0.0，无 SLIPPAGE_EXCEEDED
+        txs = [tx("x", "A", 0, 1, token="ZZZ", price=1)]
+        market = {"prices": {"OTHER": 100}}
+        res, err = decision.process(
+            request("m6", txs, market=market, slip=0.0, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["reasons"], ["PRICE_CONTEXT_MISSING"])
+        self.assertEqual(res["basis"]["maxSlippageObserved"], 0.0)
+
+    def test_market_mode_max_is_max_of_computable(self):
+        txs = [
+            tx("a", "A", 0, 1, token="T1", price=120),   # 相对 100 偏离 0.2
+            tx("b", "B", 0, 2, token="T2", price=150),   # 相对 300 偏离 0.5
+            tx("x", "C", 0, 3, token="NA", price=999),   # 无参考价
+        ]
+        market = {"prices": {"T1": 100, "T2": 300}}
+        res, err = decision.process(
+            request("m7", txs, market=market, base=100, slip=0.9, mode="market"))
+        self.assertIsNone(err)
+        self.assertEqual(res["reasons"], ["PRICE_CONTEXT_MISSING"])
+        self.assertAlmostEqual(res["basis"]["maxSlippageObserved"], 0.5)
+
+    def test_base_explicit_matches_default(self):
+        # 显式 base 与缺省口径逐字一致
+        txs = [tx("a", "A", 0, 1, price=120)]
+        out_default = decision.serialize(
+            decision.process(request("m8", txs, base=100, slip=0.1))[0])
+        out_base = decision.serialize(
+            decision.process(request("m8", txs, base=100, slip=0.1,
+                                     mode="base"))[0])
+        self.assertEqual(out_default, out_base)
+
+    def test_modes_diverge_on_same_input(self):
+        # 同一输入：base 口径放行、market 口径阻塞
+        txs = [tx("a", "A", 0, 1, token="TKN", price=100)]
+        market = {"prices": {"TKN": 200}}
+        res_base, _ = decision.process(
+            request("m9", txs, market=market, base=100, slip=0.1))
+        res_market, _ = decision.process(
+            request("m9", txs, market=market, base=100, slip=0.1,
+                    mode="market"))
+        self.assertEqual(res_base["conclusion"], "ALLOW")
+        self.assertEqual(res_market["conclusion"], "BLOCK")
+
+
 class TestInputErrors(unittest.TestCase):
     def assert_error(self, raw, code, ident="e"):
         res, err = decision.process(raw)
@@ -382,6 +497,58 @@ class TestInputErrors(unittest.TestCase):
             request("e", [tx("a", "A", 0, 1)], policy="yolo"))
         self.assertEqual(err, core.BAD_POLICY)
 
+    def test_bad_slippage_mode(self):
+        for bad in ("market2", "", "BASE", "Market", 123, True,
+                    ["base"], {"mode": "base"}):
+            self.assert_error(
+                request("e", [tx("a", "A", 0, 1)], mode=bad),
+                "BAD_SLIPPAGE_MODE")
+
+    def test_slippage_mode_missing_defaults_base(self):
+        # 缺失按 base 处理：正常放行
+        res, err = decision.process(request("e", [tx("a", "A", 0, 1)]))
+        self.assertIsNone(err)
+        self.assertEqual(res["conclusion"], "ALLOW")
+
+    def test_bad_slippage_mode_result_shape(self):
+        res, err = decision.process(
+            request("e", [tx("a", "A", 0, 1)], mode="bad"))
+        self.assertEqual(err, "BAD_SLIPPAGE_MODE")
+        self.assertEqual(res["conclusion"], "BLOCK")
+        self.assertEqual(res["reasons"], ["BAD_SLIPPAGE_MODE"])
+        self.assertFalse(res["rollbackAllowed"])
+        self.assertEqual(res["finalOrder"], [])
+        self.assertEqual(res["sandwich"]["evidence"], [])
+        self.assertEqual(res["involved"], [])
+        self.assertIsNone(res["basis"]["policy"])
+        self.assertIsNone(res["basis"]["basePrice"])
+        self.assertIsNone(res["basis"]["maxSlippage"])
+        self.assertIsNone(res["basis"]["rollbackLimit"])
+        self.assertEqual(res["basis"]["txCount"], 1)
+        self.assertEqual(res["basis"]["expectedRollback"], 0)
+        self.assertEqual(res["basis"]["rollbackRatio"], 0)
+        self.assertEqual(res["basis"]["maxSlippageObserved"], 0)
+        # 错误结果固定字段与键序
+        self.assertEqual(
+            list(res.keys()),
+            ["id", "conclusion", "finalOrder", "sandwich", "involved",
+             "reasons", "rollbackAllowed", "basis"],
+        )
+
+    def test_slippage_mode_checked_after_older_errors(self):
+        # 旧错误优先：空交易包、坏 policy、INVALID_PRICE_BASE 均先于
+        # BAD_SLIPPAGE_MODE
+        self.assert_error(request("e", [], mode="nope"), "EMPTY_BUNDLE")
+        self.assert_error(
+            request("e", [tx("a", "A", 0, 1)], policy="x", mode="nope"),
+            core.BAD_POLICY)
+        self.assert_error(
+            request("e", [tx("a", "A", 0, 1)], base=0, mode="nope"),
+            "INVALID_PRICE_BASE")
+        self.assert_error(
+            request("e", [tx("a", "A", 0, 1)], slip=2, mode="nope"),
+            "INVALID_RISK_LIMIT")
+
     def test_bool_and_nan_rejected(self):
         # 布尔值不是合法数值；NaN 不是正数
         self.assert_error(request("e", [tx("a", "A", 0, 1)], base=True),
@@ -426,6 +593,26 @@ class TestCli(unittest.TestCase):
         proc = run_cli(["--nope"], b"")
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(proc.stderr.decode("utf-8"), "BAD_ARGS\n")
+
+    def test_module_entry_market_mode(self):
+        txs = [tx("a", "A", 0, 1, token="TKN", price=100)]
+        market = {"prices": {"TKN": 200}}
+        payload = request("cm", txs, market=market, base=100, slip=0.1,
+                          mode="market").encode("utf-8")
+        proc = run_cli([], payload)
+        self.assertEqual(proc.returncode, 0)
+        res = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(res["conclusion"], "BLOCK")
+        self.assertEqual(res["reasons"], ["SLIPPAGE_EXCEEDED"])
+
+    def test_module_entry_bad_slippage_mode(self):
+        payload = request("cm2", [tx("a", "A", 0, 1)], mode="nope").encode()
+        proc = run_cli([], payload)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stderr.decode("utf-8"), "BAD_SLIPPAGE_MODE\n")
+        res = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(res["conclusion"], "BLOCK")
+        self.assertEqual(res["reasons"], ["BAD_SLIPPAGE_MODE"])
 
     def test_module_entry_input_output_files(self):
         with tempfile.TemporaryDirectory() as d:

@@ -81,7 +81,23 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 - `basePrice`：基准价格，正数；
 - `maxSlippage`：滑点上限，`[0, 1]` 含端点；
 - `rollbackLimit`：回滚范围，`[0, 1]` 含端点；
-- `policy`：可选策略，`reject`（缺省）/ `quarantine`。
+- `policy`：可选策略，`reject`（缺省）/ `quarantine`；
+- `slippageMode`：可选滑点口径，`base`（缺省）/ `market`。
+
+滑点口径：
+
+- `base`（含缺省）：沿用既有口径，以 `basePrice` 为基准按
+  `abs(price-basePrice)/basePrice` 计算每笔交易价格的绝对偏离率，
+  原因码与排序、fee 降序和 hash 升序、nonce、夹子、回滚及失败关闭
+  行为均不变。
+- `market`：每笔交易用 `market.prices` 中同 token 的正数参考价按
+  `abs(price-reference)/reference` 计算偏离率；任一结果大于
+  `maxSlippage` 时产生 `SLIPPAGE_EXCEEDED`，等于上限仍放行，多个
+  原因沿用现有优先级。token 缺少参考价时只产生
+  `PRICE_CONTEXT_MISSING`，该笔不参与滑点取值，也不追加
+  `SLIPPAGE_EXCEEDED`；`basis.maxSlippageObserved` 为可计算结果的
+  最大值，无结果时为 `0.0`。`basePrice` 在此模式仍校验并从 `basis`
+  返回。
 
 处理流程：先校验交易包、顺序与市场上下文；沿用既有 fee 排序
 语义（fee 降序、hash 升序）生成最终顺序，最终顺序恰好覆盖输入
@@ -120,7 +136,13 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
    `MISSING_MARKET_CONTEXT`；
 6. 非正基准价格：`INVALID_PRICE_BASE`；
 7. 滑点上限不在 `[0, 1]`：`INVALID_RISK_LIMIT`；
-8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`。
+8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`；
+9. 非法策略：`BAD_POLICY`；
+10. `slippageMode` 类型或取值非法（显式值只接受 `base` / `market`，
+    缺失按 `base` 处理）：`BAD_SLIPPAGE_MODE`，排在原有输入与 policy
+    校验之后，旧错误优先。错误结果字段固定、键序不变，结论 `BLOCK`，
+    `reasons` 只含 `BAD_SLIPPAGE_MODE`，`rollbackAllowed` 为 `false`，
+    其余列表为空，`basis` 保持错误结果形状与数值。
 
 ## 最小隔离计划（python -m mev_shield.mitigation）
 
