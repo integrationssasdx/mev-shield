@@ -13,7 +13,11 @@ JSON 结论。既有 ``python -m mev_shield`` 入口与公开行为保持不变�
 - ``basePrice``：基准价格，正数；
 - ``maxSlippage``：滑点上限，[0, 1] 含端点；
 - ``rollbackLimit``：回滚范围，[0, 1] 含端点；
-- ``policy``：可选策略，reject（缺省）/ quarantine。
+- ``policy``：可选策略，reject（缺省）/ quarantine；
+- ``slippageMode``：可选滑点口径，base（缺省）/ market。base 用
+  basePrice 计算每笔交易价格的绝对偏离率；market 用 market.prices 中
+  同 token 的正数参考价计算，缺参考价的交易只记 PRICE_CONTEXT_MISSING、
+  不参与滑点取值。
 
 输出字段固定：``id``、``conclusion``、``finalOrder``、``sandwich``、
 ``involved``、``reasons``、``rollbackAllowed``、``basis``。数组按最终
@@ -39,6 +43,11 @@ MISSING_MARKET_CONTEXT = "MISSING_MARKET_CONTEXT"
 INVALID_PRICE_BASE = "INVALID_PRICE_BASE"
 INVALID_RISK_LIMIT = "INVALID_RISK_LIMIT"
 INVALID_ROLLBACK_LIMIT = "INVALID_ROLLBACK_LIMIT"
+BAD_SLIPPAGE_MODE = "BAD_SLIPPAGE_MODE"
+
+# 滑点口径：base 用 basePrice；market 用 market.prices 中同 token 参考价
+SLIPPAGE_MODE_BASE = "base"
+SLIPPAGE_MODE_MARKET = "market"
 
 # 决策原因码（结论 BLOCK 时的阻塞原因）
 SANDWICH_DETECTED = "SANDWICH_DETECTED"
@@ -103,7 +112,7 @@ def parse_request(raw):
     UNIDENTIFIED_TRANSACTION -> DUPLICATE_TRANSACTION -> 交易字段
     schema -> ORDERING_CONFLICT -> MISSING_MARKET_CONTEXT ->
     INVALID_PRICE_BASE -> INVALID_RISK_LIMIT -> INVALID_ROLLBACK_LIMIT
-    -> BAD_POLICY。
+    -> BAD_POLICY -> BAD_SLIPPAGE_MODE。
     """
     try:
         data = json.loads(raw)
@@ -182,6 +191,12 @@ def parse_request(raw):
     if policy not in (core.POLICY_REJECT, core.POLICY_QUARANTINE):
         raise DecisionError(core.BAD_POLICY)
 
+    # 滑点口径：缺省 base；只接受 base / market。排在原有输入与 policy
+    # 校验之后，旧错误一律优先；类型（非字符串）或取值非法均失败
+    slippage_mode = data.get("slippageMode", SLIPPAGE_MODE_BASE)
+    if slippage_mode not in (SLIPPAGE_MODE_BASE, SLIPPAGE_MODE_MARKET):
+        raise DecisionError(BAD_SLIPPAGE_MODE)
+
     parsed = [
         {
             "hash": tx["hash"],
@@ -203,6 +218,7 @@ def parse_request(raw):
         "maxSlippage": data["maxSlippage"],
         "rollbackLimit": data["rollbackLimit"],
         "policy": policy,
+        "slippageMode": slippage_mode,
     }
 
 
@@ -382,17 +398,30 @@ def decide(req, orderer=None, detector=None, rollback=None):
     sandwich = _sandwich_result(evidence)
     involved = _involved(final_order, evidence)
 
-    # 风险检查：价格上下文完整性与相对基准价的滑点上限
+    # 风险检查：价格上下文完整性与滑点上限。
+    # base 口径：每笔相对 basePrice 取绝对偏离率，全部参与取值。
+    # market 口径：每笔相对 market.prices 中同 token 的正数参考价取
+    # abs(price-reference)/reference；缺参考价只记上下文缺失，该笔不
+    # 参与滑点取值，无任何可计算结果时 maxSlippageObserved 为 0.0。
     prices = req["market"]["prices"]
     base = req["basePrice"]
     limit = req["maxSlippage"]
+    market_mode = req["slippageMode"] == SLIPPAGE_MODE_MARKET
     max_dev = 0.0
     context_missing = False
     slippage_exceeded = False
     for tx in ordered:
-        if tx["token"] not in prices:
-            context_missing = True
-        dev = abs(tx["price"] - base) / base
+        if market_mode:
+            reference = prices.get(tx["token"])
+            if reference is None:
+                # market 口径缺参考价：只记上下文缺失，不参与滑点取值
+                context_missing = True
+                continue
+        else:
+            reference = base
+            if tx["token"] not in prices:
+                context_missing = True
+        dev = abs(tx["price"] - reference) / reference
         if dev > max_dev:
             max_dev = dev
         if dev > limit:

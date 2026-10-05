@@ -81,7 +81,9 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 - `basePrice`：基准价格，正数；
 - `maxSlippage`：滑点上限，`[0, 1]` 含端点；
 - `rollbackLimit`：回滚范围，`[0, 1]` 含端点；
-- `policy`：可选策略，`reject`（缺省）/ `quarantine`。
+- `policy`：可选策略，`reject`（缺省）/ `quarantine`；
+- `slippageMode`：可选滑点口径，`base`（缺省）/ `market`。缺失按
+  `base` 处理；类型或取值非法返回 `BAD_SLIPPAGE_MODE`（见校验优先级）。
 
 处理流程：先校验交易包、顺序与市场上下文；沿用既有 fee 排序
 语义（fee 降序、hash 升序）生成最终顺序，最终顺序恰好覆盖输入
@@ -103,6 +105,21 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
   的占比）超过范围（`ROLLBACK_LIMIT_EXCEEDED`）或确认夹子
   （`SANDWICH_DETECTED`）：结论 `BLOCK` 且 `rollbackAllowed` 为
   `false`。业务结论（含 BLOCK）退出码为 0。
+
+滑点口径（`slippageMode`）：
+
+- `base`（含缺省与显式指定）：沿用现有口径，每笔交易价格相对
+  `basePrice` 取绝对偏离率 `abs(price-basePrice)/basePrice`，全部
+  交易参与取值；token 缺市场参考价仍记 `PRICE_CONTEXT_MISSING`。
+  原因码与排序、fee 降序与 hash 升序、nonce、夹子、回滚及失败关闭
+  行为均不变。
+- `market`：每笔交易用 `market.prices` 中同 token 的正数参考价取
+  `abs(price-reference)/reference`；任一结果大于 `maxSlippage` 时
+  产生 `SLIPPAGE_EXCEEDED`，等于上限仍放行；多个原因沿用现有优先
+  级。token 缺少参考价时只产生 `PRICE_CONTEXT_MISSING`，该笔不参与
+  滑点取值，也不追加 `SLIPPAGE_EXCEEDED`；
+  `basis.maxSlippageObserved` 为所有可计算结果的最大值，无任何可
+  计算结果时为 `0.0`。`basePrice` 在此模式仍校验并从 `basis` 返回。
 - 回滚决策失败关闭：检测器、排序器或回滚评估不可用时分别记
   `DETECTION_UNAVAILABLE`、`ORDERING_UNAVAILABLE`、
   `ROLLBACK_EVALUATION_FAILED`，结论一律 `BLOCK` 且
@@ -120,7 +137,14 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
    `MISSING_MARKET_CONTEXT`；
 6. 非正基准价格：`INVALID_PRICE_BASE`；
 7. 滑点上限不在 `[0, 1]`：`INVALID_RISK_LIMIT`；
-8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`。
+8. 回滚范围不在 `[0, 1]`：`INVALID_ROLLBACK_LIMIT`；
+9. 策略取值非法：`BAD_POLICY`；
+10. `slippageMode` 类型或取值非法（缺失不算）：`BAD_SLIPPAGE_MODE`。
+    该检查排在原有输入与 policy 校验之后，上述旧错误一律优先。
+    `BAD_SLIPPAGE_MODE` 的 stdout 保持错误结果形状与固定键序：
+    结论 `BLOCK`、`reasons` 只含 `BAD_SLIPPAGE_MODE`、
+    `rollbackAllowed` 为 `false`、其余列表为空、`basis` 各字段为
+    错误结果数值（`maxSlippageObserved` 为 `0`），stderr 只写该码。
 
 ## 最小隔离计划（python -m mev_shield.mitigation）
 
