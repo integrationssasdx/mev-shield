@@ -757,12 +757,12 @@ class TestPacking(unittest.TestCase):
         # C 道：n1(fee1)  n0(fee100)，道内最高 fee 100、最小 hash c0
         # B 道：n0(fee50)
         # 道间：A、C 最高 fee 同为 100，按最小 hash a4 < c0；其后 B
-        # 输入顺序故意打乱
+        # 输入顺序故意打乱；a4 用异种 token，避免与 c1/c0 构成反向夹子
         txs = [
             tx("a5", "A", 5, 10),
             tx("b0", "B", 0, 50, side="sell"),
             tx("c1", "C", 1, 1, side="sell"),
-            tx("a4", "A", 4, 100, side="sell"),
+            tx("a4", "A", 4, 100, side="sell", token="ALT"),
             tx("c0", "C", 0, 100),
         ]
         res, _ = core.process(self.payload_packing("n", txs, "nonce"))
@@ -902,6 +902,143 @@ class TestPacking(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(serr.getvalue(), "")
         self.assertEqual(json.loads(sout.getvalue())["order"], ["s0", "s1"])
+
+
+class TestReverseSandwich(unittest.TestCase):
+    def reverse_txs(self):
+        return [
+            tx("front", "MEV", 0, 10, side="sell"),
+            tx("vic", "USER", 0, 5, side="sell"),
+            tx("back", "MEV", 1, 10, side="buy"),
+        ]
+
+    def test_reverse_sandwich_detected(self):
+        # 攻击者先卖、victim 再卖、攻击者后买回：buy 位置晚于 sell
+        res, err = core.process(payload("r", self.reverse_txs()))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(res["code"], "SANDWICH_DETECTED")
+        self.assertEqual(res["order"], [])
+        self.assertEqual(res["kept"], [])
+        self.assertEqual(res["dropped"], [])
+        self.assertEqual(res["rollback"], [])
+        self.assertEqual(len(res["hits"]), 1)
+        hit = res["hits"][0]
+        self.assertEqual(list(hit.keys()),
+                         ["buy", "victim", "sell", "token", "at"])
+        self.assertEqual(hit["buy"], "back")
+        self.assertEqual(hit["victim"], "vic")
+        self.assertEqual(hit["sell"], "front")
+        self.assertEqual(hit["token"], "TKN")
+        self.assertEqual(hit["at"], [2, 1, 0])
+
+    def test_reverse_not_sandwich_cases(self):
+        # victim 与攻击者同 from -> 不命中
+        txs = [
+            tx("f", "M", 0, 1, side="sell"),
+            tx("v", "M", 1, 1, side="sell"),
+            tx("b", "M", 2, 1, side="buy"),
+        ]
+        res, _ = core.process(payload("n", txs))
+        self.assertEqual(res["status"], "ok")
+
+        # token 不同 -> 不命中
+        txs2 = [
+            tx("f", "M", 0, 1, token="A", side="sell"),
+            tx("v", "U", 0, 1, token="B", side="sell"),
+            tx("b", "M", 1, 1, token="A", side="buy"),
+        ]
+        res2, _ = core.process(payload("n", txs2))
+        self.assertEqual(res2["status"], "ok")
+
+        # 后置买入 revert -> 不命中
+        txs3 = [
+            tx("f", "M", 0, 1, side="sell"),
+            tx("v", "U", 0, 1, side="sell"),
+            tx("b", "M", 1, 1, side="buy", sim="revert"),
+        ]
+        res3, _ = core.process(payload("n", txs3))
+        self.assertEqual(res3["status"], "ok")
+
+        # victim 为 buy（正反方向侧型不一致）-> 不命中
+        txs4 = [
+            tx("f", "M", 0, 1, side="sell"),
+            tx("v", "U", 0, 1, side="buy"),
+            tx("b", "M", 1, 1, side="buy"),
+        ]
+        res4, _ = core.process(payload("n", txs4))
+        self.assertEqual(res4["status"], "ok")
+
+    def test_mixed_hits_sorted_by_front_leg(self):
+        # 前置腿 i=0 的反向夹子与 i=1 的正向夹子：按前置腿位置升序
+        txs = [
+            tx("rs", "M", 0, 1, side="sell"),   # 反向前置 -> hit at [4, 2, 0]
+            tx("fb", "M", 1, 1, side="buy"),    # 正向前置 -> hit at [1, 3, 5]
+            tx("rv", "U", 0, 1, side="sell"),   # 反向 victim
+            tx("fv", "V", 0, 1, side="buy"),    # 正向 victim
+            tx("rb", "M", 2, 1, side="buy"),    # 反向后置买入
+            tx("fs", "M", 3, 1, side="sell"),   # 正向后置卖出
+        ]
+        res, _ = core.process(payload("m", txs))
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual([h["at"] for h in res["hits"]],
+                         [[4, 2, 0], [1, 3, 5]])
+        self.assertEqual((res["hits"][0]["buy"], res["hits"][0]["sell"]),
+                         ("rb", "rs"))
+        self.assertEqual((res["hits"][1]["buy"], res["hits"][1]["sell"]),
+                         ("fb", "fs"))
+
+    def test_reverse_overlap_hits(self):
+        # 两条前置 sell 夹同一 victim/buy：逐条保留，按前置腿升序
+        txs = [
+            tx("s2", "M", 0, 1, side="sell"),   # i=0 -> hit at [3, 2, 0]
+            tx("s1", "M", 1, 1, side="sell"),   # i=1 -> hit at [3, 2, 1]
+            tx("v", "U", 0, 1, side="sell"),    # victim
+            tx("b", "M", 2, 1, side="buy"),     # 后置买入
+        ]
+        res, _ = core.process(payload("o", txs))
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual([h["at"] for h in res["hits"]],
+                         [[3, 2, 0], [3, 2, 1]])
+
+    def test_reverse_quarantine_mitigated(self):
+        txs = self.reverse_txs() + [
+            tx("r", "OTHER", 0, 7, sim="revert"),
+            tx("k", "KEEP", 0, 6),
+        ]
+        res, err = core.process(payload("q", txs, policy="quarantine"))
+        self.assertIsNone(err)
+        self.assertEqual(res["status"], "mitigated")
+        self.assertEqual(res["code"], "SANDWICH_MITIGATED")
+        self.assertEqual([h["at"] for h in res["hits"]], [[2, 1, 0]])
+        # victim 与其他交易保留，攻击两腿各记一次 SANDWICH_DETECTED
+        self.assertEqual(res["order"], ["k", "vic"])
+        self.assertEqual(res["kept"], res["order"])
+        self.assertEqual(
+            res["rollback"],
+            [
+                {"hash": "front", "at": 0, "reason": "SANDWICH_DETECTED"},
+                {"hash": "back", "at": 2, "reason": "SANDWICH_DETECTED"},
+                {"hash": "r", "at": 3, "reason": "REVERT"},
+            ],
+        )
+        self.assertEqual(res["dropped"], ["front", "back", "r"])
+
+    def test_reverse_expired_breaks_sandwich(self):
+        # 反向夹子任一腿过期 -> 不命中，过期交易记 DEADLINE_EXPIRED
+        for pos in range(3):
+            with self.subTest(expired_leg=pos):
+                txs = [dict(t) for t in self.reverse_txs()]
+                txs[pos]["deadline"] = 1
+                raw = json.dumps({"id": "z", "transactions": txs, "block": 5})
+                res, _ = core.process(raw)
+                self.assertEqual(res["status"], "ok")
+                self.assertEqual(res["hits"], [])
+                self.assertEqual(
+                    [e["reason"] for e in res["rollback"]].count(
+                        "DEADLINE_EXPIRED"),
+                    1,
+                )
 
 
 class TestCli(unittest.TestCase):

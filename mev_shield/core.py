@@ -172,35 +172,41 @@ def peek_id(raw):
 
 
 def detect_sandwiches(txs):
-    """返回命中三元组 (i, j, k) 列表，按 (i, j, k) 升序。
+    """返回命中三元组 (buy, victim, sell) 位置列表，按攻击前置腿位置升序。
 
-    对 i<j<k：i、k 同 from，i 为 buy、k 为 sell；j 不同 from 且为 buy；
-    token 相同且三者 sim 均为 success。
+    对 i<j<k：i、k 同 from 且 side 相反，j 不同 from 且 side 与 i 相同；
+    token 相同且三者 sim 均为 success。i 为 buy 时是正向夹子（攻击者
+    先买后卖），i 为 sell 时是反向夹子（攻击者先卖后买）；同一 (i,j,k)
+    至多命中一个方向。返回元组按 (买入腿, victim, 卖出腿) 的输入位置
+    排列，故反向夹子中 buy 的位置晚于 sell；列表按前置腿 i 升序。
     """
     hits = []
     n = len(txs)
     for i in range(n - 2):
         ti = txs[i]
-        if ti["side"] != "buy" or ti["sim"] != "success":
+        if ti["sim"] != "success":
             continue
         for j in range(i + 1, n - 1):
             tj = txs[j]
             if (
-                tj["side"] != "buy"
-                or tj["sim"] != "success"
+                tj["sim"] != "success"
                 or tj["from"] == ti["from"]
                 or tj["token"] != ti["token"]
+                or tj["side"] != ti["side"]
             ):
                 continue
             for k in range(j + 1, n):
                 tk = txs[k]
                 if (
-                    tk["side"] == "sell"
-                    and tk["sim"] == "success"
+                    tk["sim"] == "success"
                     and tk["from"] == ti["from"]
                     and tk["token"] == ti["token"]
+                    and tk["side"] != ti["side"]
                 ):
-                    hits.append((i, j, k))
+                    if ti["side"] == "buy":
+                        hits.append((i, j, k))
+                    else:
+                        hits.append((k, j, i))
     return hits
 
 
@@ -338,9 +344,9 @@ def build_quarantine(txs, hits_idx, expired=(), packing=PACKING_FEE):
     攻击腿全部移除后，剩余交易按输入相对顺序不再含可识别夹子。
     """
     attack = set()
-    for (i, _j, k) in hits_idx:
-        attack.add(i)
-        attack.add(k)
+    for (buy, _victim, sell) in hits_idx:
+        attack.add(buy)
+        attack.add(sell)
     return _build(txs, expired, packing, attack)
 
 
@@ -376,18 +382,18 @@ def process(raw):
     active_idx = [at for at in range(len(txs)) if at not in expired]
     active_txs = [txs[at] for at in active_idx]
     hits_idx = [
-        (active_idx[i], active_idx[j], active_idx[k])
-        for (i, j, k) in detect_sandwiches(active_txs)
+        (active_idx[b], active_idx[v], active_idx[s])
+        for (b, v, s) in detect_sandwiches(active_txs)
     ]
     hits = [
         {
-            "buy": txs[i]["hash"],
-            "victim": txs[j]["hash"],
-            "sell": txs[k]["hash"],
-            "token": txs[i]["token"],
-            "at": [i, j, k],
+            "buy": txs[b]["hash"],
+            "victim": txs[v]["hash"],
+            "sell": txs[s]["hash"],
+            "token": txs[b]["token"],
+            "at": [b, v, s],
         }
-        for (i, j, k) in hits_idx
+        for (b, v, s) in hits_idx
     ]
 
     if policy == POLICY_QUARANTINE:
