@@ -10,7 +10,7 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划。
+最小隔离计划、预算约束隔离计划与安全重排计划。
 
 ## 夹子检测
 
@@ -203,6 +203,49 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 - 输入校验失败退出 2、stderr 写原因码，stdout 保持同形：
   `feasible` 为 false，四个列表为空，`keptFee`、`removedFee` 与
   `isolationLimit` 为 0。
+
+## 安全重排计划（python -m mev_shield.reorder）
+
+在统一决策入口的输入、校验、fee 降序与 hash 升序基线、相邻三段
+夹子证据与 nonce 依赖之上，给出一份只调整顺序、不删除交易的安全
+重排计划。参数与既有入口相同（仅 `--input` / `--output`，缺省标准
+输入 / 标准输出），不新增落盘要求；既有入口的输入、输出与退出码
+不变。
+
+- 输入在统一决策入口的根对象上新增必需字段 `maxMoves`：可改变
+  基线位置的交易数上限，非负 JSON 整数（排除布尔值）。缺失、类型
+  错误、布尔值或小于零均返回 `BAD_MOVE_LIMIT`；该校验排在统一
+  决策入口全部既有校验（含 `BAD_SLIPPAGE_MODE`）之后，旧错误一律
+  优先。
+- 基线仍按 fee 降序、hash 升序，作为 `baselineOrder`。
+- 合法性：`safeOrder` 为输入交易的一个排列（不增加、丢失或重复），
+  同一 `from` 的交易 nonce 严格递增，且顺序执行与统一决策入口相同
+  的相邻三段夹子判定后无任何夹子证据。滑点、价格上下文与回滚沿用
+  既有校验，但不参与合法性判定，不影响可行性。
+- 枚举全部排列求全局最优（不逐笔贪心），择优目标依次为：位置变化
+  数（最终下标与基线下标不同的交易笔数）最小、各交易最终下标与
+  基线下标差的绝对值和最小、最终位置对应输入下标序列的字典序
+  最小。
+
+输出字段固定：`id`、`baselineOrder`、`safeOrder`（最优安全顺序）、
+`moved`（位置变化的交易，按最终位置升序列出 `hash`、`from`（基线
+下标）、`to`（最终下标）与固定原因 `REORDERED`）、`movedCount`、
+`displacement`（位移绝对值和）、`evidence`（完整基线的全部夹子
+证据，按起始位置升序、同位按 victim hash 升序）、`blockers`
+（基线统一决策问题，仅按 `SANDWICH_DETECTED`、
+`NONCE_ORDER_VIOLATION` 顺序列出）、`result`、`feasible`、
+`maxMoves`。相同输入逐字一致。
+
+- 最优方案的位置变化数不超过 `maxMoves`：`result` 为 `OK` 且
+  `feasible` 为 true。
+- 超过 `maxMoves`：`result` 为 `MOVE_LIMIT_EXCEEDED`，`feasible`
+  为 false，仍输出最优方案；退出 0，stderr 不写码。
+- 没有任何合法顺序：`result` 为 `SAFE_ORDER_NOT_FOUND`，
+  `feasible` 为 false，`safeOrder` 与 `moved` 为空、`movedCount`
+  与 `displacement` 为 0；退出 0，stderr 不写码。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形：
+  `result` 为 `INPUT_ERROR`，`feasible` 为 false，各列表为空、
+  数值为 0。
 
 ## 约定
 
