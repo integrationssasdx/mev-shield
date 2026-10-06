@@ -10,7 +10,7 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划。
+最小隔离计划与预算约束隔离计划、安全重排计划。
 
 ## 夹子检测
 
@@ -203,6 +203,42 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
 - 输入校验失败退出 2、stderr 写原因码，stdout 保持同形：
   `feasible` 为 false，四个列表为空，`keptFee`、`removedFee` 与
   `isolationLimit` 为 0。
+
+## 安全重排计划（python -m mev_shield.reorder）
+
+在统一决策入口的输入、校验、fee 降序 / hash 升序基线、相邻三段夹子
+证据与 nonce 依赖之上，只调整交易顺序（不删除任何交易）给出无夹子
+的安全重排计划。参数与既有入口相同（仅 `--input` / `--output`，
+缺省标准输入 / 标准输出）；既有入口的输入、输出与退出码不变。
+
+- 输入在统一决策入口的根对象上新增必需字段 `maxMoves`：可改变基线
+  位置的交易数上限，非负 JSON 整数（排除布尔值）。缺失、类型错误、
+  布尔值或小于零均返回 `BAD_MOVE_LIMIT`；该校验排在统一决策入口
+  全部既有校验（含 `BAD_SLIPPAGE_MODE`）之后，旧错误一律优先。
+- `safeOrder` 恰好排列输入交易：同一 `from` 的 nonce 严格递增，且
+  按统一决策的相邻三段规则无任何夹子证据。滑点、价格上下文与回滚
+  沿用既有校验，但不参与可行性判定。
+- 择优目标依次为：位置变化数（最终下标与基线下标不同的交易数）
+  最小、各交易最终下标与基线下标差的绝对值和最小、最终位置对应
+  输入下标序列的字典序最小。枚举全部 nonce 合法交错求全局最优，
+  相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`（基线 hash 顺序）、`safeOrder`、
+`moved`（按最终位置升序列出 `hash`、`from`、`to` 与固定原因
+`REORDERED`）、`movedCount`、`displacement`、`evidence`（完整基线
+的全部夹子证据，按起始位置升序、同位按 victim hash 升序）、
+`blockers`（基线问题，仅 `SANDWICH_DETECTED`、
+`NONCE_ORDER_VIOLATION`，顺序固定）、`result`、`feasible`、
+`maxMoves`。
+
+- 最少变化数不超过 `maxMoves`：`result` 为 `OK`，`feasible` 为
+  true；超限时 `result` 为 `MOVE_LIMIT_EXCEEDED`、`feasible` 为
+  false，仍输出最优方案；没有任何合法顺序时 `result` 为
+  `SAFE_ORDER_NOT_FOUND`，`safeOrder` 与 `moved` 为空，
+  `movedCount` 与 `displacement` 为 0。超限与无方案均为正常结论：
+  退出 0，stderr 不写码。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形且
+  `result` 为 `INPUT_ERROR`，列表为空、数值为 0。
 
 ## 约定
 
