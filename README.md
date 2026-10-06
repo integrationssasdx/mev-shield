@@ -10,7 +10,7 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划、安全重排计划。
+最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划。
 
 ## 夹子检测
 
@@ -239,6 +239,47 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
   退出 0，stderr 不写码。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形且
   `result` 为 `INPUT_ERROR`，列表为空、数值为 0。
+
+## 多区块排程计划（python -m mev_shield.schedule）
+
+在统一决策入口的输入、校验、fee 降序 / hash 升序基线、相邻三段夹子
+证据与 nonce 依赖之上，把未过期交易排入一个多区块窗口：窗口为
+`block` 到 `block + scheduleBlocks - 1`，每个区块至多容纳
+`blockCapacity` 笔交易。参数与既有入口相同（仅 `--input` /
+`--output`，缺省标准输入 / 标准输出）；既有入口的输入、输出与
+退出码不变。
+
+- 输入在统一决策交易包上新增 `block`（非负 JSON 整数）、
+  `scheduleBlocks`（正 JSON 整数）、`blockCapacity`（正 JSON 整数）
+  与交易级可选 `deadline`（非负 JSON 整数），均排除布尔值；非法
+  依次返回 `BAD_BLOCK`、`BAD_SCHEDULE_WINDOW`、`BAD_BLOCK_CAPACITY`、
+  `BAD_DEADLINE`，排在统一决策入口全部既有校验（含
+  `BAD_SLIPPAGE_MODE`）之后，旧错误一律优先。
+- `deadline < block` 的交易过期：不参与排程，也不参与夹子判定。
+  未过期交易至多进一个不晚于自身 `deadline` 的窗口区块，无
+  `deadline` 可进任意窗口区块。
+- 各块内按 fee 降序、hash 升序，跨块按区块升序拼接得
+  `scheduledOrder`；该顺序上同一 `from` 的 nonce 严格递增，且按
+  统一决策的相邻三段规则无任何夹子证据。
+- 择优目标依次为：排程笔数最多、排程 fee 总和最高、`totalDelay`
+  （各交易所在区块减 `block` 之和）最小、`scheduledOrder` 对应输入
+  下标序列字典序最小。枚举全部排程方案求全局最优，不做逐笔贪心；
+  相同输入逐字一致。
+
+输出字段固定：`id`、`block`、`scheduleBlocks`、`blockCapacity`、
+`baselineOrder`（全部交易的 fee 降序、hash 升序基线顺序）、
+`blocks`（窗口每个区块的 `block` / `order`）、`scheduledOrder`、
+`unscheduled`（按输入位置列出 `hash`、`at` 与 `reason`，原因仅
+`DEADLINE_EXPIRED` 与 `SCHEDULE_SKIPPED`）、`scheduledFee`、
+`unscheduledFee`（相应 fee 总和）、`totalDelay`、`evidence`
+（未过期基线子序列上的全部夹子证据，按起始位置升序、同位按
+victim hash 升序）、`feasible`。
+
+- `feasible` 仅在未过期交易全部排程时为 true；否则为 false，
+  仍输出最优部分排程。无完整排程不是输入错误：退出 0，stderr
+  不写码。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形：
+  列表为空、数值为 0、`feasible` 为 false。
 
 ## 约定
 
