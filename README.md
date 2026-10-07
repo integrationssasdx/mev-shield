@@ -10,7 +10,8 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划。
+最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划、
+双预算守卫计划。
 
 ## 夹子检测
 
@@ -237,6 +238,50 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
   `SAFE_ORDER_NOT_FOUND`，`safeOrder` 与 `moved` 为空，
   `movedCount` 与 `displacement` 为 0。超限与无方案均为正常结论：
   退出 0，stderr 不写码。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形且
+  `result` 为 `INPUT_ERROR`，列表为空、数值为 0。
+
+## 双预算守卫计划（python -m mev_shield.guarded）
+
+在统一决策入口的输入、校验与 fee 降序 / hash 升序基线之上，把预算
+隔离与安全重排合并：既移除高风险交易（不超过 `isolationLimit` 笔），
+又在受限的位置变化（不超过 `maxMoves` 笔）内重排保留集合。参数与
+既有入口相同（仅 `--input` / `--output`，缺省标准输入 / 标准输出）；
+既有入口的输入、输出与退出码不变。
+
+- 输入在统一决策入口的根对象上新增必需字段 `isolationLimit`（最多
+  移除笔数）与 `maxMoves`（相对基线可改变位置的交易数上限），均为
+  非负 JSON 整数（排除布尔值）。校验排在统一决策入口全部既有校验
+  （含 `BAD_SLIPPAGE_MODE`）之后，两者依次校验；非法依次唯一返回
+  `BAD_ISOLATION_LIMIT`、`BAD_MOVE_LIMIT`，旧错误一律优先。
+- 合法性：保留交易逐笔通过滑点与价格上下文检查（market 口径缺
+  token 正数参考价的交易不可保留）；保留集合 revert 占比不超过
+  `rollbackLimit`（空集合占比视为 0）；同一 `from` 的 nonce 在最终
+  顺序上严格递增；最终顺序无任何相邻三段夹子证据。
+- 择优目标依次为：保留 fee 总和最高、保留笔数最多、位置变化数
+  （最终下标与基线下标不同的保留交易数）最少、位移绝对值和最小、
+  被移除交易按输入位置的 hash 序列字典序最小、最终位置对应输入
+  下标序列字典序最小。枚举全部预算内子集与 nonce 合法交错求全局
+  最优，相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`、`selectedOrder`、`removed`
+（按输入位置列出 `hash`、`at` 与固定原因 `RISK_REMOVED`）、`moved`
+（按最终位置列出 `hash`、`from`、`to` 与固定原因 `REORDERED`）、
+`keptFee`、`removedFee`、`movedCount`、`displacement`、
+`requiredMoves`、`evidence`（完整基线的全部夹子证据，按起始位置
+升序、同位按 victim hash 升序）、`blockers`（基线统一决策的原因码，
+按 riskplan 固定顺序去重）、`result`、`feasible`、`isolationLimit`、
+`maxMoves`。
+
+- `requiredMoves` 为只计 `isolationLimit` 与合法性（不计
+  `maxMoves`）的最少位置变化数，无合法集合时为 0。
+- 双预算均满足：`result` 为 `OK`，`feasible` 为 true；预算内无任何
+  合法保留集合时为 `ISOLATION_LIMIT_EXCEEDED`；`requiredMoves`
+  超过 `maxMoves` 时为 `MOVE_LIMIT_EXCEEDED`。后两者 `feasible`
+  为 false，`selectedOrder` / `removed` / `moved` 为空，`keptFee` /
+  `removedFee` / `movedCount` / `displacement` 为 0，超限时
+  `requiredMoves` 仍保留实测最小值；均为正常结论：退出 0，stderr
+  不写码。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形且
   `result` 为 `INPUT_ERROR`，列表为空、数值为 0。
 
