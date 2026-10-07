@@ -11,7 +11,7 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
 最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划、
-双预算守卫计划。
+双预算守卫计划、不可拆分交易捆绑联合排程。
 
 ## 夹子检测
 
@@ -325,6 +325,45 @@ victim hash 升序）、`feasible`。
   不写码。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形：
   列表为空、数值为 0、`feasible` 为 false。
+
+## 不可拆分交易捆绑联合排程（python -m mev_shield.bundleschedule）
+
+在统一决策入口与多区块排程计划的输入、校验、fee 降序 / hash 升序
+基线、相邻三段夹子证据与 nonce 依赖之上，把带非空 `bundle` 标识的
+交易按同值标识组成不可拆分捆绑，整组排入多区块窗口。参数与既有入口
+相同（仅 `--input` / `--output`，缺省标准输入 / 标准输出）；公开
+入口不改，其余字段与错误码沿用多区块排程计划。
+
+- 输入在多区块排程字段（`block` / `scheduleBlocks` / `blockCapacity`
+  与交易级可选 `deadline`）之上，要求每笔交易携带非空字符串
+  `bundle`；缺失或非非空字符串返回 `BAD_BUNDLE_ID`，排在多区块排程
+  四项校验之后，统一决策入口全部既有校验（含 `BAD_SLIPPAGE_MODE`）
+  一律优先。
+- 同值交易组成捆绑：段内顺序取输入相对位置，捆绑初始次序取首笔
+  交易的输入位置。每个捆绑只能整组进入一个区块并占连续段，段内
+  顺序不变；全局顺序按区块和段顺序拼接，恰好覆盖已选交易。
+- 任一成员 `deadline` 早于起始区块则整组过期；否则只能进入所有
+  期限允许且容量足够（剩余空间能容纳整组）的区块。
+- 最终全局顺序中同一 `from` 的 nonce 严格递增，并按统一决策的
+  相邻三段规则无任何夹子证据。
+- 择优目标依次为：排程交易数最多、排程 fee 总和最高、`totalDelay`
+  （各交易所在区块与起始区块的差之和）最小、全局顺序对应输入下标
+  序列字典序最小。枚举全部捆绑排程方案求全局最优，不做逐笔贪心；
+  相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`（全部交易的 fee 降序、hash
+升序基线顺序）、`blocks`（窗口每个区块的 `block` / `order`）、
+`unscheduled`（按捆绑首笔位置列出 `bundle`、`at`、`hashes` 与
+`reason`，原因仅 `DEADLINE_EXPIRED`、`CAPACITY_EXCEEDED`、
+`BUNDLE_SKIPPED`；整组过期优先，其次无任何区块容量足以容纳整组，
+其余为 `BUNDLE_SKIPPED`）、`scheduledFee`、`unscheduledFee`、
+`totalDelay`、`evidence`（未过期基线子序列上的全部夹子证据，按
+起始位置升序、同位按 victim hash 升序）、`feasible`。
+
+- `feasible` 仅在全部捆绑排入时为 true；否则返回最优部分排程并为
+  false。部分排程不是输入错误：退出 0，stderr 为空。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 同形：列表为空、
+  数值为 0、`feasible` 为 false。
 
 ## 约定
 
