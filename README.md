@@ -360,10 +360,54 @@ victim hash 升序）、`feasible`。
 `totalDelay`、`evidence`（未过期基线子序列上的全部夹子证据，按
 起始位置升序、同位按 victim hash 升序）、`feasible`。
 
-- `feasible` 仅在全部捆绑排入时为 true；否则返回最优部分排程并为
+- `feasible` 仅在全部捆绑排程时为 true；否则返回最优部分排程并为
   false。部分排程不是输入错误：退出 0，stderr 为空。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 同形：列表为空、
   数值为 0、`feasible` 为 false。
+
+## 不可拆分捆绑风险隔离计划（python -m mev_shield.bundleisolate）
+
+在风险约束隔离计划（riskplan）的输入、校验、fee 降序 / hash 升序
+基线、滑点 / 价格上下文 / nonce / 夹子与 `rollbackLimit` 口径之上，
+结合 bundleschedule 的不可拆分捆绑语义：同值 `bundle` 的交易只能
+整组保留或整组移除，并按交易笔数消耗 `isolationLimit` 预算。参数
+与既有入口相同（仅 `--input` / `--output`，缺省标准输入 / 标准
+输出）；公开入口不改，错误码仅新增 `BAD_BUNDLE_ID`。
+
+- 输入沿用统一决策交易包加 `isolationLimit`（非负 JSON 整数，排除
+  布尔值），另要求每笔交易携带非空字符串 `bundle`。校验顺序：先
+  统一决策全部既有校验，再 `isolationLimit`（失败
+  `BAD_ISOLATION_LIMIT`），最后逐笔 `bundle`（缺失或非非空字符串
+  `BAD_BUNDLE_ID`）；旧错误一律优先，stderr 只写唯一码。
+- 同值交易组成捆绑：成员保持输入相对位置，捆绑按首笔交易的输入
+  位置定序。每个捆绑二选一：全部成员按基线相对顺序保留，或整组
+  移除；保留集合沿 riskplan 逐笔滑点 / 价格上下文检查、同 `from`
+  nonce 严格递增、无夹子证据、revert 占比不超 `rollbackLimit`
+  （空集合占比视为 0）。
+- 移除预算按交易笔数计：各被移除捆绑成员数之和不超过
+  `isolationLimit`，而非按捆绑数。
+- 择优目标依次为：保留 fee 总和最高、保留笔数最多、被移除捆绑按
+  首笔输入位置形成的整数序列字典序最小。枚举全部原子方案求全局
+  最优，不做逐笔贪心；相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`（全部交易的 fee 降序、hash
+升序基线顺序）、`selectedOrder`（最优保留集合按基线相对顺序）、
+`removed`（按捆绑首笔位置列出 `bundle`、`at`、`hashes` 与固定原因
+`BUNDLE_REMOVED`，`hashes` 保持输入相对位置）、`keptFee`、
+`removedFee`（总 fee 减 keptFee）、`evidence`（完整基线的全部夹子
+证据，按起始位置升序、同位按 victim hash 升序）、`blockers`（基线
+统一决策原因码，按 riskplan 固定顺序去重）、`feasible`、
+`isolationLimit`。
+
+- `feasible` 为 true 时：`selectedOrder` 与 `removed` 中各捆绑
+  `hashes` 不重不漏覆盖输入交易，`keptFee` 与 `removedFee` 之和
+  等于输入 fee 总和，被移除交易笔数不超过 `isolationLimit`。
+- 预算内无合法方案不是输入错误：退出 0，stderr 为空，`feasible`
+  为 false，`selectedOrder`、`removed` 为空，`keptFee`、
+  `removedFee` 为 0，`baselineOrder`、`evidence`、`blockers` 与
+  `isolationLimit` 真实值仍保留。
+- 输入校验失败退出 2、stderr 仅写唯一原因码，stdout 同形：列表
+  为空、数值为 0、`feasible` 为 false。
 
 ## 约定
 
