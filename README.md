@@ -10,8 +10,9 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划、
-双预算守卫计划、不可拆分交易捆绑联合排程。
+最小隔离计划与预算约束隔离计划、风险约束隔离计划、安全重排计划、
+多区块排程计划、双预算守卫计划、不可拆分交易捆绑联合排程、
+捆绑原子性风险隔离计划。
 
 ## 夹子检测
 
@@ -364,6 +365,51 @@ victim hash 升序）、`feasible`。
   false。部分排程不是输入错误：退出 0，stderr 为空。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 同形：列表为空、
   数值为 0、`feasible` 为 false。
+
+## 捆绑原子性风险隔离计划（python -m mev_shield.bundleisolate）
+
+在风险约束隔离计划的输入、校验、fee 降序 / hash 升序基线与风险
+合法性，以及不可拆分交易捆绑的同值 `bundle` 语义之上，把带非空
+`bundle` 标识的交易按同值标识组成不可拆分捆绑：同值捆绑只能整组
+保留或整组移除，被移除交易笔数不超过批次级预算。参数与既有入口
+相同（仅 `--input` / `--output`，缺省标准输入 / 标准输出）；公开
+入口不改，风险字段、证据与错误码沿用风险约束隔离计划。
+
+- 输入在风险约束隔离计划的根对象（含必需 `isolationLimit`）之上，
+  要求每笔交易携带非空字符串 `bundle`。校验顺序固定：先完整执行
+  统一决策入口的全部既有校验，再校验 `isolationLimit`（缺失、类型
+  错误、布尔值或小于零返回 `BAD_ISOLATION_LIMIT`），最后逐笔校验
+  `bundle`（缺失或非非空字符串返回 `BAD_BUNDLE_ID`）；旧错误一律
+  优先，两类新错误只返回其一。
+- 同值交易组成捆绑：成员保持输入相对位置，捆绑初始次序取首笔交易
+  的输入位置。保留集合按基线（fee 降序、hash 升序）的相对顺序排列，
+  合法性沿用风险约束隔离计划：逐笔通过价格上下文与滑点检查，同
+  `from` 的 nonce 严格递增，无任何相邻三段夹子证据，revert 占比不
+  超过 `rollbackLimit`（空集合占比视为 0）。
+- 捆绑仅当全部成员都可保留时才进入候选保留集合；任一成员必须移除
+  则整组移除。移除预算按交易笔数计（被移除捆绑的成员笔数之和），
+  不得超过 `isolationLimit`。
+- 择优目标依次为：保留 fee 总和最高、保留交易数最多、被移除捆绑按
+  其首笔交易输入位置形成的序列字典序最小。枚举全部预算内捆绑保留
+  方案求全局最优，不做逐笔贪心；相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`（全部交易的 fee 降序、hash
+升序基线顺序）、`selectedOrder`（最优保留集合按基线相对顺序）、
+`removed`（按捆绑首笔输入位置列出 `bundle`、`at`、`hashes` 与
+固定原因 `BUNDLE_REMOVED`，`hashes` 取成员输入相对顺序）、
+`keptFee`、`removedFee`（总 fee 减 `keptFee`）、`evidence`
+（完整基线的全部夹子证据，按起始位置升序、同位按 victim hash
+升序）、`blockers`（沿风险约束隔离计划固定顺序）、`feasible`、
+`isolationLimit`（真实值）。
+
+- `feasible` 为 true 时：`selectedOrder` 与 `removed` 不重不漏覆盖
+  输入交易，`keptFee` 与 `removedFee` 之和等于输入 fee 总和。
+- 预算内无合法方案不是输入错误：退出 0，stderr 为空，`feasible`
+  为 false，`selectedOrder` 与 `removed` 为空，`keptFee` 与
+  `removedFee` 为 0，`baselineOrder`、`evidence`、`blockers` 与
+  `isolationLimit` 仍取真实值。
+- 输入校验失败退出 2、stderr 仅写唯一原因码，stdout 保持同形：
+  列表为空、数值为 0、`feasible` 为 false、`isolationLimit` 为 0。
 
 ## 约定
 
