@@ -10,7 +10,8 @@ MEV 交易保护服务：交易打包排序、夹子检测与回滚保护。
 
 已实现：JSON 批处理校验、双向夹子检测、reject / quarantine 策略、
 fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统一决策入口、
-最小隔离计划与预算约束隔离计划、安全重排计划、多区块排程计划。
+最小隔离计划与预算约束隔离计划、风险约束隔离计划、安全重排计划、
+统一隔离重排、多区块排程计划。
 
 ## 夹子检测
 
@@ -239,6 +240,53 @@ fee / nonce 两种打包模式、回滚记录，以及区块期限保护、统�
   退出 0，stderr 不写码。
 - 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形且
   `result` 为 `INPUT_ERROR`，列表为空、数值为 0。
+
+## 统一隔离重排（python -m mev_shield.guarded）
+
+在统一决策入口的输入、校验、fee 降序 / hash 升序基线、相邻三段夹子
+证据与 nonce 依赖之上，把风险约束隔离与安全重排合并为一次决策：先
+按批次预算移除风险交易，再在保留集合内调整顺序，给出无夹子的安全
+顺序。参数与既有入口相同（仅 `--input` / `--output`，缺省标准输入 /
+标准输出）；既有入口的输入、输出与退出码不变。
+
+- 输入在统一决策交易包上新增两个必需字段：`isolationLimit`（最多
+  移除笔数）与 `maxMoves`（最终顺序相对基线的位置变化数上限），均为
+  非负 JSON 整数（排除布尔值）。旧校验一律优先；`isolationLimit`
+  非法返回 `BAD_ISOLATION_LIMIT`，其合法而 `maxMoves` 非法时才返回
+  `BAD_MOVE_LIMIT`。
+- 保留集合沿用风险约束隔离的合法性：逐笔通过滑点与价格上下文检查
+  （`market` 模式缺 token 正数参考价不可保留）、revert 占比不超过
+  `rollbackLimit`（空集合视为 0）、同一 `from` 的 nonce 在最终顺序
+  严格递增、无任何相邻三段夹子；且被移除笔数不超过
+  `isolationLimit`。枚举移除预算内的全部保留子集，再枚举其发送者
+  道的全部 nonce 合法交错（增量排除夹子），不做逐笔贪心。
+- 位置变化数指保留交易最终下标与其在完整基线下标不同的数量；移除
+  前缀交易会把保留笔压向更前的下标。`requiredMoves` 为隔离预算内
+  所有合法方案的最少位置变化数，只取决于 `isolationLimit` 与合法性，
+  与 `maxMoves` 无关；无合法集合时为 0。
+- 择优目标依次为：保留 fee 总和最高、保留笔数最多、位置变化数最少、
+  各位移绝对值和最小、被移除交易按输入位置的 hash 序列字典序最小、
+  最终顺序对应输入下标序列字典序最小。相同输入逐字一致。
+
+输出字段固定：`id`、`baselineOrder`、`selectedOrder`、`removed`
+（按输入位置列出 `hash`、`at` 与固定原因 `RISK_REMOVED`，去重）、
+`moved`（按最终位置升序列出 `hash`、`from`、`to` 与固定原因
+`REORDERED`，去重）、`keptFee`、`removedFee`、`movedCount`、
+`displacement`、`requiredMoves`、`evidence`（完整基线的全部夹子证据，
+按起始位置升序、同位按 victim hash 升序）、`blockers`（基线统一
+决策原因码去重，顺序同风险约束隔离计划）、`result`、`feasible`、
+`isolationLimit`、`maxMoves`。
+
+- 双预算同时满足：`result` 为 `OK`、`feasible` 为 true。
+- 隔离预算内无任何合法保留集合：`result` 为
+  `ISOLATION_LIMIT_EXCEEDED`。
+- 存在合法集合但 `requiredMoves` 超过 `maxMoves`：`result` 为
+  `MOVE_LIMIT_EXCEEDED`，`requiredMoves` 仍给出实测最少变化数。
+- 后两者 `feasible` 为 false，各列表为空、金额与移动统计为 0；
+  `baselineOrder`、`evidence` 与 `blockers` 仍取完整基线。无方案或
+  超限都是正常结论：退出 0，stderr 不写码。
+- 输入校验失败退出 2、stderr 写唯一原因码，stdout 保持同形：
+  列表为空、数值为 0、`feasible` 为 false。
 
 ## 多区块排程计划（python -m mev_shield.schedule）
 
